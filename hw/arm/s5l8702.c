@@ -168,7 +168,6 @@ static void s5l8702_realize(DeviceState *dev, Error **errp) {
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->lcd), 0, S5L8702_LCD_BASE);
 
     /* JPEG */
-    s->jpeg.sysmem = get_system_memory();
     s->jpeg.nsas = cpu_get_address_space(CPU(&s->cpu), ARMASIdx_NS);
     sysbus_realize(SYS_BUS_DEVICE(&s->jpeg), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->jpeg), 0, S5L8702_JPEG_BASE);
