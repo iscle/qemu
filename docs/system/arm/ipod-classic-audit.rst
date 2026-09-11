@@ -740,16 +740,70 @@ changes do not yet scale byte timing. Alternate clock selection at ``+0x14``,
 wire-level gate effects and retention of a physical divider mid-byte remain
 unverified. Register accesses remain available while the clock is gated.
 
-8. JPEG decoder shortcuts
-~~~~~~~~~~~~~~~~~~~~~~~~~
+8. JPEG block processing and remaining decoder gaps
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**Source-confirmed workarounds.** ``hw/misc/s5l8702-jpeg.c`` assumes
-320x240 with 4:2:0 sampling. It decodes the whole frame on the first
-trigger and fakes per-MCU staging on subsequent triggers. It additionally
-writes decoded planes at ``OUT_CR + 0x10000``, a firmware-specific scratch
-buffer assumption rather than a demonstrated hardware DMA destination.
-One busy bit toggles on reads. Dimensions, incremental state, completion,
-DMA bounds/errors, and reset during decoding are incomplete.
+**Frame and scratch-buffer shortcuts removed.** The original EFI
+``JpegDecoder.stripped.fixed`` function ``0xe34`` arms three output banks
+at ``+0x5000c`` using ``0x80``, ``0x40000080`` and ``0x80000080``.
+It then submits six 8x8 blocks through ``+0x41800`` and requests each
+block's coefficient DMA at ``+0x3010c``. It checks DMA status bit 1 after
+each pair and acknowledges it at ``+0x60000``. The CPU copies the resulting
+tiles into the image planes. The 320x240 image dimensions belong to this
+software loop, not an established fixed hardware frame size.
+
+Original retailOS ``0x08090cb0`` independently uses the same block path,
+arming one of two output banks for two blocks. ``0x0807ea68`` supplies
+interrupt source 45; setup in ``0x0807e7dc`` enables the global DMA summary
+with ``+0x00004=0x40`` and pair completion with ``+0x60004=2``.
+``0x0807213c`` dispatches the masked DMA events and ``0x0809fd08``
+acknowledges pair completion. These paths were decompiled and checked
+against the original ARM/Thumb instructions, rather than inferred from
+the old emulator's register names.
+
+The model now processes one coefficient block per request. It consumes
+256 input bytes, applies the selected quantization table and IDCT, and
+writes an 8x8 tile into the armed destination. The observed paired-block
+layout places the second block eight bytes after the first with a 32-byte
+row stride. It writes only those tile bytes. There is no whole-frame cache,
+MCU trigger counter, fixed image size, or ``OUT_CR + 0x10000`` write.
+The old read-driven busy toggle and always-successful DMA status are gone.
+Busy remains asserted while the command awaits its coefficient request;
+pair completion is latched, maskable and W1C, connected to VIC source 45.
+The observed input mode consumes big-endian signed 32-bit coefficients in
+zigzag order and reverses bytes within each output word.
+
+A private original-input boot executes 1,800 block requests. Its 115,200
+decoded plane bytes match the previous output byte for byte, while the CPU
+performs all frame assembly. Executing instruction ranges from the EFI
+driver were also compared with the supplied module. The normal main menu
+and Music menu were inspected afterward; the damaged original OS marker
+remains unchanged. Evidence is in ``ipod-work/jpeg-engine/``: original
+decompilations/disassembly, ``boot-comparison.json``, block traces and UI
+captures. This preserves the demonstrated boot output; it is not a
+comparison with a physical decoder or an end-to-end retailOS photo test.
+
+Regression tests reproduce the old unsolicited output when a bank is
+merely armed. They cover incremental input changes, bank ordering, both
+quantization tables, DC clipping, horizontal/vertical AC orientation,
+untouched row padding and scratch memory, IRQ masking/acknowledgement,
+reset and a snapshot between the two blocks. DMA rejects MMIO, truncated
+input, RAM boundary crossings and 32-bit output wraparound before writing
+a tile. Invalid transfers remain pending without a fabricated completion;
+the hardware error-reporting fields are still unknown.
+
+**Still incomplete.** Processing is synchronous: cycle timing, clock gates,
+bus contention and overlap between stages are not modeled. There is no
+new arbitrary completion timer. Only the observed ``0x20341`` command
+(plus quantization-table selection), ``DMA_CONFIG=0x182`` and
+``LAYOUT=0x10001`` mode are implemented. Entropy decoding, alternate
+coefficient formats, other layouts/strides, input rings, additional events,
+sub-engine reset commands and stop/restart retention need further work.
+The three-bank queue, destination latching when armed, duplicate-bank
+rejection and behavior for reordered requests are model choices needing
+confirmation beyond the checked driver sequences. Floating-point IDCT
+rounding has not been compared with physical hardware. General JPEG files,
+photos, artwork and video remain unverified.
 
 9. Playback and media databases
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1428,6 +1482,11 @@ SPI now serializes its FIFOs, receive budget, registers, and input clock.
 Tests restore queued data after reset and resume a NOR read through the
 flash's saved protocol state. This does not establish whole-machine or
 cross-version snapshot compatibility.
+JPEG now uses Resettable and VMState version 1 for quantization tables,
+registers, input position, armed output banks and a pending block. A qtest
+restores the second block of a pair and its RAM output. Earlier snapshots
+had no JPEG state and cannot establish compatibility with this model;
+whole-machine migration remains unverified.
 The codec's active/frozen clock controls and MCLK input were introduced in
 VMState version 2; the current transition model uses version 4 as described
 below. Post-load rebuilds LRCK without invoking consumer callbacks.
@@ -1488,7 +1547,7 @@ There are large commented-out code blocks. The shared PL080 change needs
 particular care because it affects other machines. This is not yet an
 upstream-ready device series or a completed modernization of the QEMU base.
 
-The sixty-two qtests cover boot-related register/IRQ paths, selected planar
+The eighty qtests cover boot-related register/IRQ paths, selected planar
 composition/blending, LCD bounds/GRAM behavior, TE signalling, GPIO
 interrupt masking/polarity/acknowledgement, hold input, and RTC/alarm
 behavior. New RTC cases include delayed writes, leap and non-leap rollover,
@@ -1501,6 +1560,8 @@ of a fractional tick during frequency changes, and snapshot restoration.
 I2C cases check deferred ACK/data and read-to-clear effects, cancellation
 by STOP/disable/reset, deadline resolution, both clock gates, paused-byte
 retention, and running/suspended byte snapshots.
+JPEG cases check block ordering, coefficient/quantization data, output
+boundaries, completion IRQs, reset and restoration during a block pair.
 SPI cases cover FIFO accounting/clearing, NOR receive limits, empty reads,
 all three clock gates and SETUP controls, reset, and controller/NOR snapshot
 restoration, including suspended automatic reception.

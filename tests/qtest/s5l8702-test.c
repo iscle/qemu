@@ -21,6 +21,9 @@
 #define DMA0 0x38200000
 #define SM1 0x38500000
 #define UART0 0x3cc00000
+#define JPEG 0x39600000
+#define JPEG_INPUT 0x08002000
+#define JPEG_OUTPUT 0x08004000
 
 static char *rom, *nor, *disk;
 
@@ -44,6 +47,215 @@ static QTestState *start_with_args(const char *args)
 static QTestState *start(void)
 {
     return start_with_args("");
+}
+
+static void jpeg_setup(QTestState *q, unsigned blocks)
+{
+    uint8_t coefficients[6 * 256] = { 0 };
+
+    g_assert_cmpuint(blocks, <=, 6);
+    qtest_memwrite(q, JPEG_INPUT, coefficients, blocks * 256);
+    for (unsigned i = 0; i < 64; i++) {
+        qtest_writel(q, JPEG + 0x41200 + i * 4, i ? 1 : 8);
+        qtest_writel(q, JPEG + 0x41300 + i * 4, i ? 1 : 16);
+    }
+    qtest_writel(q, JPEG + 0x60010, 0x182);
+    qtest_writel(q, JPEG + 0x6006c, 0x10001);
+    qtest_writel(q, JPEG + 0x60018, JPEG_INPUT);
+    qtest_writel(q, JPEG + 0x6001c, JPEG_INPUT + blocks * 256);
+    qtest_writel(q, JPEG + 0x6000c, 3);
+}
+
+static void jpeg_coefficient(QTestState *q, unsigned block, unsigned index,
+                              int32_t value)
+{
+    uint8_t word[4];
+
+    stl_be_p(word, value);
+    qtest_memwrite(q, JPEG_INPUT + block * 256 + index * 4, word, 4);
+}
+
+static void jpeg_arm(QTestState *q, unsigned bank, uint32_t address)
+{
+    qtest_writel(q, JPEG + 0x6002c + bank * 16, address);
+    qtest_writel(q, JPEG + 0x5000c, (bank << 30) | 0x80);
+}
+
+static void jpeg_block(QTestState *q, unsigned table)
+{
+    qtest_writel(q, JPEG + 0x41800, 0x20341 | (table << 19));
+    qtest_writel(q, JPEG + 0x3010c, 0x31 | (table << 3));
+}
+
+static void jpeg_check_pair(QTestState *q, uint32_t address,
+                            uint8_t left, uint8_t right)
+{
+    uint8_t pixels[256];
+
+    qtest_memread(q, address, pixels, sizeof(pixels));
+    for (unsigned y = 0; y < 8; y++) {
+        for (unsigned x = 0; x < 32; x++) {
+            g_assert_cmpuint(pixels[y * 32 + x], ==,
+                             x < 8 ? left : x < 16 ? right : 0xa5);
+        }
+    }
+}
+
+static void test_jpeg_blocks(void)
+{
+    static const int dc[] = { 80, -80, 240, -200, 4, -4 };
+    QTestState *q = start();
+    uint8_t sentinel[256];
+
+    memset(sentinel, 0xa5, sizeof(sentinel));
+    jpeg_setup(q, 6);
+    for (unsigned i = 0; i < 6; i++) {
+        jpeg_coefficient(q, i, 0, dc[i]);
+    }
+    for (unsigned bank = 0; bank < 3; bank++) {
+        qtest_memwrite(q, JPEG_OUTPUT + bank * 4096,
+                       sentinel, sizeof(sentinel));
+    }
+    qtest_memwrite(q, JPEG_OUTPUT + 0x12000, sentinel, sizeof(sentinel));
+    /* Bank selection comes from the command, not a fixed MCU counter. */
+    jpeg_arm(q, 1, JPEG_OUTPUT + 4096);
+    jpeg_arm(q, 0, JPEG_OUTPUT);
+    jpeg_arm(q, 2, JPEG_OUTPUT + 8192);
+    jpeg_check_pair(q, JPEG_OUTPUT + 4096, 0xa5, 0xa5);
+    qtest_irq_intercept_in(q, "/machine/soc/cpu");
+    qtest_writel(q, VIC1 + 0x10, 1 << 13);
+    qtest_writel(q, JPEG + 4, 0x40);
+    qtest_writel(q, JPEG + 0x60004, 2);
+    qtest_writel(q, JPEG + 0x41800, 0x20341);
+    /* Status reads must not complete an operation awaiting coefficient DMA. */
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x41808), ==, 2);
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x41808), ==, 2);
+    qtest_writel(q, JPEG + 0x3010c, 0x31);
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x41808), ==, 0);
+    jpeg_check_pair(q, JPEG_OUTPUT + 4096, 208, 0xa5);
+    g_assert_false(qtest_get_irq(q, 0));
+    /* The next block is read on its own request, not cached with the first. */
+    jpeg_coefficient(q, 1, 0, -64);
+    jpeg_block(q, 0);
+    jpeg_check_pair(q, JPEG_OUTPUT + 4096, 208, 64);
+    g_assert_true(qtest_get_irq(q, 0));
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x60000), ==, 2);
+    g_assert_cmphex(qtest_readl(q, JPEG), ==, 0x40);
+    qtest_writel(q, JPEG + 0x60000, 1);
+    g_assert_true(qtest_get_irq(q, 0));
+    qtest_writel(q, JPEG + 4, 0);
+    g_assert_false(qtest_get_irq(q, 0));
+    qtest_writel(q, JPEG + 4, 0x40);
+    g_assert_true(qtest_get_irq(q, 0));
+    qtest_writel(q, JPEG + 0x60000, 2);
+    g_assert_false(qtest_get_irq(q, 0));
+    for (unsigned i = 2; i < 6; i++) {
+        jpeg_block(q, i >= 4);
+    }
+    jpeg_check_pair(q, JPEG_OUTPUT, 255, 0);
+    jpeg_check_pair(q, JPEG_OUTPUT + 8192, 136, 120);
+    /* The model must never write the old OUT_CR + 0x10000 scratch shortcut. */
+    jpeg_check_pair(q, JPEG_OUTPUT + 0x12000, 0xa5, 0xa5);
+    qtest_quit(q);
+}
+
+static void test_jpeg_ac(void)
+{
+    static const uint8_t horizontal[] = {
+        139, 137, 134, 130, 126, 122, 119, 117,
+    };
+    static const uint8_t vertical[] = {
+        150, 147, 141, 132, 124, 115, 109, 106,
+    };
+    QTestState *q = start();
+    uint8_t pixels[256];
+
+    jpeg_setup(q, 2);
+    jpeg_coefficient(q, 0, 1, 64);
+    jpeg_coefficient(q, 1, 2, 64);
+    qtest_writel(q, JPEG + 0x41200 + 8 * 4, 2);
+    jpeg_arm(q, 0, JPEG_OUTPUT);
+    jpeg_block(q, 0);
+    jpeg_block(q, 0);
+    qtest_memread(q, JPEG_OUTPUT, pixels, sizeof(pixels));
+    for (unsigned y = 0; y < 8; y++) {
+        for (unsigned x = 0; x < 8; x++) {
+            g_assert_cmpuint(pixels[y * 32 + (x ^ 3)], ==, horizontal[x]);
+            g_assert_cmpuint(pixels[y * 32 + 8 + (x ^ 3)], ==, vertical[y]);
+        }
+    }
+    qtest_quit(q);
+}
+
+static void test_jpeg_state(void)
+{
+    QTestState *q = start();
+    uint8_t sentinel[256];
+    char *result;
+
+    memset(sentinel, 0xa5, sizeof(sentinel));
+    jpeg_setup(q, 2);
+    qtest_memwrite(q, JPEG_OUTPUT, sentinel, sizeof(sentinel));
+    jpeg_coefficient(q, 0, 0, 16);
+    jpeg_coefficient(q, 1, 0, -16);
+    jpeg_arm(q, 2, JPEG_OUTPUT);
+    jpeg_block(q, 0);
+    qtest_writel(q, JPEG + 0x41800, 0x20341);
+    result = qtest_hmp(q, "savevm jpeg-pending");
+    g_assert_cmpstr(result, ==, "");
+    g_free(result);
+    qtest_writel(q, JPEG + 0x3010c, 0x31);
+    jpeg_check_pair(q, JPEG_OUTPUT, 144, 112);
+    result = qtest_hmp(q, "loadvm jpeg-pending");
+    g_assert_cmpstr(result, ==, "");
+    g_free(result);
+    jpeg_check_pair(q, JPEG_OUTPUT, 144, 0xa5);
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x41808), ==, 2);
+    qtest_writel(q, JPEG + 0x3010c, 0x31);
+    jpeg_check_pair(q, JPEG_OUTPUT, 144, 112);
+    qtest_writel(q, JPEG + 0x41800, 0x20341);
+    qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x41808), ==, 0);
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x60000), ==, 0);
+    g_assert_cmphex(qtest_readl(q, JPEG + 0x41200), ==, 0);
+    jpeg_setup(q, 2);
+    jpeg_arm(q, 0, JPEG_OUTPUT);
+    jpeg_block(q, 0);
+    jpeg_block(q, 0);
+    jpeg_check_pair(q, JPEG_OUTPUT, 128, 128);
+    qtest_quit(q);
+}
+
+static void test_jpeg_dma_bounds(void)
+{
+    static const struct {
+        uint32_t input, end, output;
+    } invalid[] = {
+        { JPEG_INPUT, JPEG_INPUT + 255, JPEG_OUTPUT },
+        { 0x39600000, 0x39600200, JPEG_OUTPUT },
+        { 0x0bffff80, 0x0c000180, JPEG_OUTPUT },
+        { JPEG_INPUT, JPEG_INPUT + 512, 0x0bffff80 },
+        { JPEG_INPUT, JPEG_INPUT + 512, 0xfffffff8 },
+        { JPEG_INPUT, JPEG_INPUT + 512, 0x39600000 },
+    };
+    QTestState *q = start();
+    uint8_t sentinel[256], actual[256];
+
+    memset(sentinel, 0xa5, sizeof(sentinel));
+    for (unsigned i = 0; i < ARRAY_SIZE(invalid); i++) {
+        qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+        jpeg_setup(q, 2);
+        qtest_memwrite(q, JPEG_OUTPUT, sentinel, sizeof(sentinel));
+        qtest_writel(q, JPEG + 0x60018, invalid[i].input);
+        qtest_writel(q, JPEG + 0x6001c, invalid[i].end);
+        jpeg_arm(q, 0, invalid[i].output);
+        jpeg_block(q, 0);
+        g_assert_cmphex(qtest_readl(q, JPEG + 0x41808), ==, 2);
+        g_assert_cmphex(qtest_readl(q, JPEG + 0x60000), ==, 0);
+        qtest_memread(q, JPEG_OUTPUT, actual, sizeof(actual));
+        g_assert_cmpmem(actual, sizeof(actual), sentinel, sizeof(sentinel));
+    }
+    qtest_quit(q);
 }
 
 static void test_vic(void)
@@ -3361,6 +3573,10 @@ int main(int argc, char **argv)
     qtest_add_func("/s5l8702/uart/receive-timeout", test_uart_receive_timeout);
     qtest_add_func("/s5l8702/uart/formats", test_uart_formats);
     qtest_add_func("/s5l8702/i2s-stop", test_i2s_stop);
+    qtest_add_func("/s5l8702/jpeg-blocks", test_jpeg_blocks);
+    qtest_add_func("/s5l8702/jpeg-ac", test_jpeg_ac);
+    qtest_add_func("/s5l8702/jpeg-state", test_jpeg_state);
+    qtest_add_func("/s5l8702/jpeg-dma-bounds", test_jpeg_dma_bounds);
     qtest_add_func("/s5l8702/i2c", test_i2c);
     qtest_add_func("/s5l8702/i2c-stop", test_i2c_stop);
     qtest_add_func("/s5l8702/i2c-completion", test_i2c_completion);

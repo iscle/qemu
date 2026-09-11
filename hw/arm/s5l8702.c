@@ -208,9 +208,11 @@ static void s5l8702_realize(DeviceState *dev, Error **errp) {
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->tvo), 5, S5L8702_TVO_ENCODER_CONFIG);
 
     /* JPEG */
-    s->jpeg.nsas = cpu_get_address_space(CPU(&s->cpu), ARMASIdx_NS);
     sysbus_realize(SYS_BUS_DEVICE(&s->jpeg), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->jpeg), 0, S5L8702_JPEG_BASE);
+    /* Original retailOS 0x0807ea68 installs JPEG's handler on source 45. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->jpeg), 0,
+                       s5l8702_get_irq(s, 45));
 
     /* DMA */
     for (uint32_t i = 0; i < ARRAY_SIZE(s->dma); i++) {

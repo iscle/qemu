@@ -1,47 +1,54 @@
 /*
- * Samsung S5L8702 JPEG decoder (as used in iPod Classic).
+ * Samsung S5L8702 JPEG block processor.
+ * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Tailored to the Apple OF boot-time JPEG path. See the header for
- * documented limitations (hard-coded 320x240 4:2:0; software full-decode
- * with faked per-MCU staging).
+ * Original EFI JpegDecoder 0xe34 and retailOS 0x08090cb0 arm output banks
+ * with 0x5000c, submit an IDCT command at 0x41800, and request coefficient
+ * input at 0x3010c. Each pair of 8x8 blocks completes one output bank.
+ * The CPU assembles the image; the device has no fixed frame dimensions.
  *
- * This file is licensed under the GNU GPL, version 2 or later.
+ * Only the observed dequantization/IDCT and paired-block DMA mode is
+ * implemented. Processing is synchronous; hardware clock timing, entropy
+ * decoding, other DMA layouts and precise error flags remain unverified.
  */
 #include "qemu/osdep.h"
+#include "exec/address-spaces.h"
+#include "hw/misc/s5l8702-jpeg.h"
+#include "hw/irq.h"
+#include "migration/vmstate.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "hw/sysbus.h"
-#include "exec/cpu-common.h"
-#include "hw/core/cpu.h"
-#include "hw/misc/s5l8702-jpeg.h"
-
+#include "trace.h"
 #include <math.h>
 
-/* Encoded data the JPEG hardware would receive: 4 luma + 1 Cb + 1 Cr DCT
- * blocks of 64 coefficients each. Each coefficient comes in as a
- * big-endian uint32_t. */
-typedef struct {
-    uint32_t coeff[64];
-} S5L8702JpegBlock;
+#define JPEG_STATUS         0x00000
+#define JPEG_MASK           0x00004
+#define JPEG_CONFIG         0x00010
+#define JPEG_INPUT_COMMAND  0x3010c
+#define JPEG_QTABLE0        0x41200
+#define JPEG_QTABLE1        0x41300
+#define JPEG_COMMAND        0x41800
+#define JPEG_CORE_STATUS    0x41808
+#define JPEG_OUTPUT_COMMAND 0x5000c
+#define JPEG_OUTPUT_STATUS  0x50014
+#define JPEG_DMA_STATUS     0x60000
+#define JPEG_DMA_MASK       0x60004
+#define JPEG_DMA_CONTROL    0x6000c
+#define JPEG_DMA_CONFIG     0x60010
+#define JPEG_INPUT_BASE     0x60018
+#define JPEG_INPUT_END      0x6001c
+#define JPEG_OUTPUT0        0x6002c
+#define JPEG_OUTPUT1        0x6003c
+#define JPEG_OUTPUT2        0x6004c
+#define JPEG_LAYOUT         0x6006c
 
-typedef struct {
-    S5L8702JpegBlock lum[4];
-    S5L8702JpegBlock chromb;
-    S5L8702JpegBlock chromr;
-} S5L8702JpegEncMcu;
+#define JPEG_DMA_IRQ        BIT(6)
+#define JPEG_PAIR_DONE      BIT(1)
+#define JPEG_QSELECT        BIT(19)
+#define JPEG_IDCT_COMMAND   0x20341
 
-typedef struct {
-    /* Per-MCU IDCT results, before reconstruction into the full planes.
-     * yplane is 16x16 (one MCU). cbplane/crplane are 8x8 chroma blocks;
-     * the trailing rows/columns of the 16x16 array are unused but kept
-     * to simplify indexing. */
-    double yplane[16][16];
-    double crplane[16][16];
-    double cbplane[16][16];
-} S5L8702JpegDecMcu;
-
-/* Standard JPEG zigzag scan order. Indexed by natural-order position,
- * gives the zigzag-scan index. */
+/* Natural-order coefficient position to zigzag input index. */
 static const uint8_t jpeg_zigzag[64] = {
      0,  1,  5,  6, 14, 15, 27, 28,
      2,  4,  7, 13, 16, 26, 29, 42,
@@ -53,415 +60,387 @@ static const uint8_t jpeg_zigzag[64] = {
     35, 36, 48, 49, 57, 58, 62, 63,
 };
 
-/* Precomputed 4D IDCT basis table: idct_basis[y][x][u][v] =
- *   c(u) * c(v) * cos((2x+1)uπ/16) * cos((2y+1)vπ/16)
- * Built once on first use. */
+/* Immutable after class initialization. No frame-sized intermediate buffers. */
 static double idct_basis[8][8][8][8];
-static bool idct_basis_ready;
 
-static void s5l8702_jpeg_build_idct_basis(void)
+static void jpeg_build_basis(void)
 {
-    if (idct_basis_ready) {
-        return;
-    }
-    for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < 8; x++) {
-            for (int u = 0; u < 8; u++) {
-                for (int v = 0; v < 8; v++) {
-                    double cu = (u == 0) ? (1.0 / sqrt(2.0)) : 1.0;
-                    double cv = (v == 0) ? (1.0 / sqrt(2.0)) : 1.0;
+    for (unsigned y = 0; y < 8; y++) {
+        for (unsigned x = 0; x < 8; x++) {
+            for (unsigned u = 0; u < 8; u++) {
+                for (unsigned v = 0; v < 8; v++) {
+                    double cu = u == 0 ? 1.0 / sqrt(2.0) : 1.0;
+                    double cv = v == 0 ? 1.0 / sqrt(2.0) : 1.0;
                     idct_basis[y][x][u][v] = cu * cv *
-                        cos(((2 * x + 1) * u * M_PI) / 16.0) *
-                        cos(((2 * y + 1) * v * M_PI) / 16.0);
+                        cos((2 * y + 1) * u * M_PI / 16.0) *
+                        cos((2 * x + 1) * v * M_PI / 16.0);
                 }
             }
         }
     }
-    idct_basis_ready = true;
 }
 
-static uint8_t clamp_to_byte(double x)
+static void jpeg_idct(const uint8_t *input, const uint32_t *qtable,
+                      uint8_t output[8][8])
 {
-    if (x < 0.0) {
-        return 0;
-    }
-    if (x > 255.0) {
-        return 255;
-    }
-    return (uint8_t)x;
-}
+    double dct[8][8];
 
-/* Decode a single 8x8 block via dequantize + IDCT. Output samples are
- * stored at out[(*)(y_off + y)][x_off + x] with `level shift` +128. */
-static void s5l8702_jpeg_idct_block(const S5L8702JpegBlock *block,
-                                    const uint32_t *qtable,
-                                    double out[16][16],
-                                    int y_off, int x_off)
-{
-    int32_t dct[8][8];
-
-    for (int l = 0; l < 64; l++) {
-        uint32_t coeff = __builtin_bswap32(block->coeff[jpeg_zigzag[l]]);
-        dct[l / 8][l % 8] = (int32_t)coeff * (int32_t)qtable[l];
+    for (unsigned i = 0; i < 64; i++) {
+        int32_t coefficient = (int32_t)ldl_be_p(input + 4 * jpeg_zigzag[i]);
+        dct[i / 8][i % 8] = (double)coefficient * qtable[i];
     }
-
-    for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < 8; x++) {
-            double sum = 0.0;
-            for (int u = 0; u < 8; u++) {
-                for (int v = 0; v < 8; v++) {
+    for (unsigned y = 0; y < 8; y++) {
+        for (unsigned x = 0; x < 8; x++) {
+            double sum = 0;
+            for (unsigned u = 0; u < 8; u++) {
+                for (unsigned v = 0; v < 8; v++) {
                     sum += idct_basis[y][x][u][v] * dct[u][v];
                 }
             }
-            out[y_off + y][x_off + x] = round(sum / 4.0 + 128.0);
+            /* The observed DMA mode reverses bytes within each output word. */
+            output[y][x ^ 3] = MIN(255, MAX(0, round(sum / 4.0 + 128.0)));
         }
     }
 }
 
-/* Run the full software JPEG decode for one frame. The encoded MCUs are
- * expected in (width/16)x(height/16) raster order. */
-static void s5l8702_jpeg_decode_frame(const S5L8702JpegEncMcu *mcus,
-                                      const uint32_t *qtable1,
-                                      const uint32_t *qtable2,
-                                      uint8_t *y_out,
-                                      uint8_t *cb_out,
-                                      uint8_t *cr_out)
+static void jpeg_update_irq(S5L8702JpegState *s)
 {
-    S5L8702JpegDecMcu *decoded = g_new(S5L8702JpegDecMcu, S5L8702_JPEG_NUM_MCUS);
-    double *y_dbl  = g_new(double, S5L8702_JPEG_Y_PLANE_SIZE);
-    double *cb_dbl = g_new(double, S5L8702_JPEG_C_PLANE_SIZE);
-    double *cr_dbl = g_new(double, S5L8702_JPEG_C_PLANE_SIZE);
-
-    s5l8702_jpeg_build_idct_basis();
-
-    /* IDCT every block of every MCU. */
-    for (int i = 0; i < S5L8702_JPEG_NUM_MCUS; i++) {
-        /* 4 luma 8x8 blocks make up the 16x16 MCU. */
-        for (int row = 0; row < 2; row++) {
-            for (int col = 0; col < 2; col++) {
-                s5l8702_jpeg_idct_block(&mcus[i].lum[row * 2 + col],
-                                        qtable1, decoded[i].yplane,
-                                        col * 8, row * 8);
-            }
-        }
-        s5l8702_jpeg_idct_block(&mcus[i].chromb, qtable2,
-                                decoded[i].cbplane, 0, 0);
-        s5l8702_jpeg_idct_block(&mcus[i].chromr, qtable2,
-                                decoded[i].crplane, 0, 0);
-    }
-
-    /* Reconstruct full planes. The IDCT here stores f(x_loop,y_loop) at
-     * yplane[y_loop][x_loop] (a transposed layout); reconstruction reads
-     * yplane[x][y] which inverts the transpose. Net effect: pixel (x,y)
-     * inside an MCU lands at image (mcu_col*16 + x, mcu_row*16 + y). */
-    for (int i = 0; i < S5L8702_JPEG_NUM_MCUS; i++) {
-        int mcu_col = i % S5L8702_JPEG_MCUS_X;
-        int mcu_row = i / S5L8702_JPEG_MCUS_X;
-        int y_base  = mcu_col * 16 + mcu_row * 16 * S5L8702_JPEG_IMG_WIDTH;
-        int c_base  = mcu_col * 8  + mcu_row * 8  * S5L8702_JPEG_CHROMA_WIDTH;
-
-        for (int y = 0; y < 16; y++) {
-            for (int x = 0; x < 16; x++) {
-                y_dbl[y_base + y * S5L8702_JPEG_IMG_WIDTH + x] =
-                    decoded[i].yplane[x][y];
-            }
-        }
-        for (int y = 0; y < 8; y++) {
-            for (int x = 0; x < 8; x++) {
-                int off = c_base + y * S5L8702_JPEG_CHROMA_WIDTH + x;
-                cb_dbl[off] = decoded[i].cbplane[x][y];
-                cr_dbl[off] = decoded[i].crplane[x][y];
-            }
-        }
-    }
-
-    /* Clamp to 8-bit. */
-    for (int i = 0; i < S5L8702_JPEG_Y_PLANE_SIZE; i++) {
-        y_out[i] = clamp_to_byte(y_dbl[i]);
-    }
-    for (int i = 0; i < S5L8702_JPEG_C_PLANE_SIZE; i++) {
-        cb_out[i] = clamp_to_byte(cb_dbl[i]);
-        cr_out[i] = clamp_to_byte(cr_dbl[i]);
-    }
-
-    /* The hardware/firmware contract is to read each plane back as
-     * big-endian 32-bit words. Reverse byte order within each 4-pixel
-     * group to match. */
-    for (int i = 0; i < S5L8702_JPEG_Y_PLANE_SIZE; i += 4) {
-        uint32_t *w = (uint32_t *)&y_out[i];
-        *w = __builtin_bswap32(*w);
-    }
-    for (int i = 0; i < S5L8702_JPEG_C_PLANE_SIZE; i += 4) {
-        uint32_t *cb_w = (uint32_t *)&cb_out[i];
-        uint32_t *cr_w = (uint32_t *)&cr_out[i];
-        *cb_w = __builtin_bswap32(*cb_w);
-        *cr_w = __builtin_bswap32(*cr_w);
-    }
-
-    g_free(decoded);
-    g_free(y_dbl);
-    g_free(cb_dbl);
-    g_free(cr_dbl);
+    qemu_set_irq(s->irq, (s->irq_mask & JPEG_DMA_IRQ) &&
+                         (s->dma_status & s->dma_mask));
 }
 
-/* Build a single MCU's staging buffers in the layout that the firmware's
- * gBS->CopyMem source expects:
- *   y_stage[r*32 + c]  : luma rows 0..7    of the MCU, cols 0..15
- *   cb_stage[r*32 + c] : luma rows 8..15   of the MCU, cols 0..15
- *   cr_stage[r*32 + 0..7]  : Cb 8x8 of the MCU
- *   cr_stage[r*32 + 8..15] : Cr 8x8 of the MCU
- *
- * The 16-byte tail of each 32-byte row is unused; we leave it zero.
- */
-static void s5l8702_jpeg_build_mcu_stage(S5L8702JpegState *s,
-                                         uint32_t mcu_idx,
-                                         uint8_t *y_stage,
-                                         uint8_t *cb_stage,
-                                         uint8_t *cr_stage)
+/* Reject device recursion and transfers outside the 32-bit address space. */
+static bool jpeg_valid_ram(uint64_t address, size_t length, bool write)
 {
-    uint32_t mc_col = mcu_idx % S5L8702_JPEG_MCUS_X;
-    uint32_t mc_row = mcu_idx / S5L8702_JPEG_MCUS_X;
+    MemoryRegionSection section;
+    bool valid;
 
-    memset(y_stage,  0, S5L8702_JPEG_STAGE_SIZE);
-    memset(cb_stage, 0, S5L8702_JPEG_STAGE_SIZE);
-    memset(cr_stage, 0, S5L8702_JPEG_STAGE_SIZE);
-
-    for (int r = 0; r < S5L8702_JPEG_STAGE_ROWS; r++) {
-        const uint8_t *y_top = &s->cached_y[
-            (mc_row * 16 + r) * S5L8702_JPEG_IMG_WIDTH + mc_col * 16];
-        const uint8_t *y_bot = &s->cached_y[
-            (mc_row * 16 + 8 + r) * S5L8702_JPEG_IMG_WIDTH + mc_col * 16];
-        memcpy(&y_stage[r  * S5L8702_JPEG_STAGE_STRIDE], y_top, 16);
-        memcpy(&cb_stage[r * S5L8702_JPEG_STAGE_STRIDE], y_bot, 16);
-
-        const uint8_t *cb_row = &s->cached_cb[
-            (mc_row * 8 + r) * S5L8702_JPEG_CHROMA_WIDTH + mc_col * 8];
-        const uint8_t *cr_row = &s->cached_cr[
-            (mc_row * 8 + r) * S5L8702_JPEG_CHROMA_WIDTH + mc_col * 8];
-        memcpy(&cr_stage[r * S5L8702_JPEG_STAGE_STRIDE + 0], cb_row, 8);
-        memcpy(&cr_stage[r * S5L8702_JPEG_STAGE_STRIDE + 8], cr_row, 8);
+    if (address + length > (1ULL << 32)) {
+        return false;
     }
+    section = memory_region_find(get_system_memory(), address, length);
+    valid = section.mr && memory_region_is_ram(section.mr) &&
+            (!write || !memory_region_is_rom(section.mr)) &&
+            int128_eq(section.size, int128_make64(length));
+    if (section.mr) {
+        memory_region_unref(section.mr);
+    }
+    return valid;
 }
 
-/* Drop any cached decode state (called between frames and on reset). */
-static void s5l8702_jpeg_drop_cache(S5L8702JpegState *s)
+static void jpeg_process_block(S5L8702JpegState *s, uint32_t input_command)
 {
-    g_free(s->cached_y);
-    g_free(s->cached_cb);
-    g_free(s->cached_cr);
-    s->cached_y = NULL;
-    s->cached_cb = NULL;
-    s->cached_cr = NULL;
-    s->ctrl_trigger_count = 0;
-}
+    uint8_t coefficients[256], pixels[8][8];
+    uint64_t output;
+    unsigned bank;
 
-/* JPEG_REG_CTRL write handler.
- *
- * The first trigger of a new frame runs the full software decode and
- * writes Y/Cb/Cr to the software-conversion buffer (the firmware reads
- * these directly for its YCbCr->RGB conversion).
- *
- * Every trigger (including the first) also "stages" the current MCU's
- * data into the YPLANE/CBPLANE/CRPLANE registers so that the firmware's
- * per-MCU gBS->CopyMem populates every position of its plane buffer.
- * Without this, the very last MCU's CopyMem reads stale staging and the
- * bottom-right 16x16 corner of the image renders as zeros (green).
- */
-static void s5l8702_jpeg_handle_ctrl(S5L8702JpegState *s, uint32_t val)
-{
-    if (s->cached_y == NULL) {
-        S5L8702JpegEncMcu *mcus =
-            g_new(S5L8702JpegEncMcu, S5L8702_JPEG_NUM_MCUS);
-
-        s->cached_y  = g_malloc(S5L8702_JPEG_Y_PLANE_SIZE);
-        s->cached_cb = g_malloc(S5L8702_JPEG_C_PLANE_SIZE);
-        s->cached_cr = g_malloc(S5L8702_JPEG_C_PLANE_SIZE);
-
-        address_space_read(s->nsas, s->coeff_base, MEMTXATTRS_UNSPECIFIED,
-                           mcus, sizeof(*mcus) * S5L8702_JPEG_NUM_MCUS);
-        s5l8702_jpeg_decode_frame(mcus, s->qtable1, s->qtable2,
-                                  s->cached_y, s->cached_cb, s->cached_cr);
-
-        uint32_t sw_base = s->out_cr_addr + S5L8702_JPEG_SW_PLANE_OFFSET;
-        address_space_write(s->nsas, sw_base, MEMTXATTRS_UNSPECIFIED,
-                            s->cached_y, S5L8702_JPEG_Y_PLANE_SIZE);
-        address_space_write(s->nsas, sw_base + S5L8702_JPEG_Y_PLANE_SIZE,
-                            MEMTXATTRS_UNSPECIFIED,
-                            s->cached_cb, S5L8702_JPEG_C_PLANE_SIZE);
-        address_space_write(s->nsas, sw_base + S5L8702_JPEG_Y_PLANE_SIZE
-                                              + S5L8702_JPEG_C_PLANE_SIZE,
-                            MEMTXATTRS_UNSPECIFIED,
-                            s->cached_cr, S5L8702_JPEG_C_PLANE_SIZE);
-        g_free(mcus);
+    if (!s->pending || !(s->dma_control & 1) || !s->output_count) {
+        return;
     }
-
-    uint32_t mcu_idx = s->ctrl_trigger_count / S5L8702_JPEG_CTRL_PER_MCU;
-    if (mcu_idx >= S5L8702_JPEG_NUM_MCUS) {
-        mcu_idx = S5L8702_JPEG_NUM_MCUS - 1;
+    if ((s->command & ~JPEG_QSELECT) != JPEG_IDCT_COMMAND ||
+        (input_command != 0x31 && input_command != 0x39) ||
+        s->dma_config != 0x182 || s->layout != 0x10001) {
+        qemu_log_mask(LOG_UNIMP, "s5l8702-jpeg: unsupported block mode\n");
+        return;
     }
-
-    uint8_t y_stage[S5L8702_JPEG_STAGE_SIZE];
-    uint8_t cb_stage[S5L8702_JPEG_STAGE_SIZE];
-    uint8_t cr_stage[S5L8702_JPEG_STAGE_SIZE];
-    s5l8702_jpeg_build_mcu_stage(s, mcu_idx, y_stage, cb_stage, cr_stage);
-
-    address_space_write(s->nsas, s->out_y_addr, MEMTXATTRS_UNSPECIFIED,
-                        y_stage, sizeof(y_stage));
-    address_space_write(s->nsas, s->out_cb_addr, MEMTXATTRS_UNSPECIFIED,
-                        cb_stage, sizeof(cb_stage));
-    address_space_write(s->nsas, s->out_cr_addr, MEMTXATTRS_UNSPECIFIED,
-                        cr_stage, sizeof(cr_stage));
-
-    s->ctrl_trigger_count++;
-    if (s->ctrl_trigger_count >=
-        S5L8702_JPEG_NUM_MCUS * S5L8702_JPEG_CTRL_PER_MCU) {
-        s5l8702_jpeg_drop_cache(s);
+    bank = s->output_queue[0];
+    output = (uint64_t)s->output_address[bank] + s->block_in_pair * 8;
+    if ((uint64_t)s->input_cursor + sizeof(coefficients) > s->input_end ||
+        !jpeg_valid_ram(s->input_cursor, sizeof(coefficients), false)) {
+        goto invalid_dma;
     }
-
-    (void)val;  /* val is logged at the call site if needed */
-}
-
-static uint64_t s5l8702_jpeg_read(void *opaque, hwaddr offset, unsigned size)
-{
-    S5L8702JpegState *s = S5L8702_JPEG(opaque);
-
-    if (getenv("JPEG_TRACE") && offset == 0x41808 && current_cpu) {
-        static uint32_t last;
-        uint32_t pc = (uint32_t)CPU_GET_CLASS(current_cpu)->get_pc(current_cpu);
-        if (pc != last) {
-            fprintf(stderr, "JPEG41808 read pc=0x%08x\n", pc);
-            last = pc;
+    for (unsigned y = 0; y < 8; y++) {
+        if (!jpeg_valid_ram(output + y * 32, 8, true)) {
+            goto invalid_dma;
         }
+    }
+    if (address_space_read(&address_space_memory, s->input_cursor,
+                           MEMTXATTRS_UNSPECIFIED, coefficients,
+                           sizeof(coefficients)) != MEMTX_OK) {
+        goto invalid_dma;
+    }
+    jpeg_idct(coefficients, s->qtable[!!(s->command & JPEG_QSELECT)], pixels);
+    for (unsigned y = 0; y < 8; y++) {
+        if (address_space_write(&address_space_memory, output + y * 32,
+                                MEMTXATTRS_UNSPECIFIED, pixels[y], 8) !=
+            MEMTX_OK) {
+            goto invalid_dma;
+        }
+    }
+    trace_s5l8702_jpeg_block(s->input_cursor, output, s->command, bank,
+                            s->block_in_pair);
+    s->input_cursor += sizeof(coefficients);
+    s->pending = false;
+    if (++s->block_in_pair == 2) {
+        s->block_in_pair = 0;
+        s->output_count--;
+        memmove(s->output_queue, s->output_queue + 1, s->output_count);
+        s->dma_status |= JPEG_PAIR_DONE;
+        jpeg_update_irq(s);
+    }
+    return;
+
+invalid_dma:
+    /* Error status is not established; do not invent successful completion. */
+    qemu_log_mask(LOG_GUEST_ERROR, "s5l8702-jpeg: invalid block DMA\n");
+}
+
+static uint64_t jpeg_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8702JpegState *s = opaque;
+
+    if (offset >= JPEG_QTABLE0 && offset < JPEG_QTABLE1 + 256) {
+        return s->qtable[(offset - JPEG_QTABLE0) / 256][(offset & 255) / 4];
     }
     switch (offset) {
-    case S5L8702_JPEG_REG_UNK_STATUS:
-        /* The firmware polls this; returning -1 satisfies its check. */
-        return 0xFFFFFFFF;
-    case 0x41808:
-        /*
-         * retailOS 35.2.0.4 decode-status; bit 1 (0x2) is the engine "busy"
-         * flag. The guest writes a start command then polls this until busy
-         * clears. We do not decode for this register layout, so complete
-         * instantly: report busy on the first read after a start (so the guest
-         * sees the op accepted) and idle afterwards (so its wait loop
-         * advances).
-         * Other bits stay set for the status-present check the guest makes.
-         */
-        if (s->status_toggle) {
-            s->status_toggle = 0;
-            return 0xFFFFFFFF;       /* busy, just this once */
-        }
-        return 0xFFFFFFFD;           /* idle / done */
-    case 0x50014:
-        /*
-         * Engine status polled at 0x0bf0eeec: bit 16 = "busy". Report not-busy
-         * (0) so the JPEG-engine drive loop advances instead of spinning.
-         */
-        return 0x00000000;
+    case JPEG_STATUS:
+        return s->dma_status ? JPEG_DMA_IRQ : 0;
+    case JPEG_MASK:
+        return s->irq_mask;
+    case JPEG_CONFIG:
+        return s->config;
+    case JPEG_CORE_STATUS:
+        return s->pending ? BIT(1) : 0;
+    case JPEG_OUTPUT_STATUS:
+        return 0;
+    case JPEG_DMA_STATUS:
+        return s->dma_status;
+    case JPEG_DMA_MASK:
+        return s->dma_mask;
+    case JPEG_DMA_CONTROL:
+        return s->dma_control;
+    case JPEG_DMA_CONFIG:
+        return s->dma_config;
+    case JPEG_INPUT_BASE:
+        return s->input_base;
+    case JPEG_INPUT_END:
+        return s->input_end;
+    case JPEG_OUTPUT0:
+    case JPEG_OUTPUT1:
+    case JPEG_OUTPUT2:
+        return s->output_base[(offset - JPEG_OUTPUT0) / 16];
+    case JPEG_LAYOUT:
+        return s->layout;
     default:
-        qemu_log_mask(LOG_UNIMP,
-                      "%s: unimplemented read (offset 0x%05x)\n",
-                      __func__, (uint32_t)offset);
+        qemu_log_mask(LOG_UNIMP, "s5l8702-jpeg: read at 0x%" HWADDR_PRIx
+                      "\n", offset);
         return 0;
     }
 }
 
-static void s5l8702_jpeg_write(void *opaque, hwaddr offset, uint64_t val,
-                               unsigned size)
+static void jpeg_write(void *opaque, hwaddr offset, uint64_t value,
+                        unsigned size)
 {
-    S5L8702JpegState *s = S5L8702_JPEG(opaque);
+    S5L8702JpegState *s = opaque;
+    unsigned bank;
 
-    /* Quantization table uploads. */
-    if (offset >= S5L8702_JPEG_REG_QTABLE1 &&
-        offset <  S5L8702_JPEG_REG_QTABLE1 + S5L8702_JPEG_QTABLE_BYTES) {
-        s->qtable1[(offset - S5L8702_JPEG_REG_QTABLE1) / 4] = val;
+    if (offset >= JPEG_QTABLE0 && offset < JPEG_QTABLE1 + 256) {
+        s->qtable[(offset - JPEG_QTABLE0) / 256][(offset & 255) / 4] = value;
         return;
     }
-    if (offset >= S5L8702_JPEG_REG_QTABLE2 &&
-        offset <  S5L8702_JPEG_REG_QTABLE2 + S5L8702_JPEG_QTABLE_BYTES) {
-        s->qtable2[(offset - S5L8702_JPEG_REG_QTABLE2) / 4] = val;
-        return;
-    }
-
+    trace_s5l8702_jpeg_write(offset, value);
     switch (offset) {
-    case 0x41800:
-        /*
-         * Decode start/command (retailOS 35.2.0.4). Mark the engine busy for
-         * the next status read at 0x41808; we complete instantly.
-         */
-        s->status_toggle = 1;
+    case JPEG_STATUS:
+        /* The DMA summary remains asserted while a child event is pending. */
         break;
-    case S5L8702_JPEG_REG_COEFF_BASE:
-        s->coeff_base = val;
+    case JPEG_MASK:
+        s->irq_mask = value;
+        jpeg_update_irq(s);
         break;
-    case S5L8702_JPEG_REG_OUT_Y:
-        s->out_y_addr = val;
+    case JPEG_CONFIG:
+        s->config = value;
         break;
-    case S5L8702_JPEG_REG_OUT_CB:
-        s->out_cb_addr = val;
+    case JPEG_DMA_STATUS:
+        s->dma_status &= ~value;
+        jpeg_update_irq(s);
         break;
-    case S5L8702_JPEG_REG_OUT_CR:
-        s->out_cr_addr = val;
+    case JPEG_DMA_MASK:
+        s->dma_mask = value;
+        jpeg_update_irq(s);
         break;
-    case S5L8702_JPEG_REG_CTRL:
-        s5l8702_jpeg_handle_ctrl(s, val);
+    case JPEG_DMA_CONTROL:
+        s->dma_control = value;
+        if (!(value & 1)) {
+            s->pending = false;
+        }
+        break;
+    case JPEG_DMA_CONFIG:
+        s->dma_config = value;
+        break;
+    case JPEG_INPUT_BASE:
+        s->input_base = s->input_cursor = value;
+        break;
+    case JPEG_INPUT_END:
+        s->input_end = value;
+        break;
+    case JPEG_OUTPUT0:
+    case JPEG_OUTPUT1:
+    case JPEG_OUTPUT2:
+        s->output_base[(offset - JPEG_OUTPUT0) / 16] = value;
+        break;
+    case JPEG_LAYOUT:
+        s->layout = value;
+        break;
+    case JPEG_COMMAND:
+        if (s->pending) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "s5l8702-jpeg: command while busy\n");
+            break;
+        }
+        s->command = value;
+        s->pending = true;
+        break;
+    case JPEG_INPUT_COMMAND:
+        jpeg_process_block(s, value);
+        break;
+    case JPEG_OUTPUT_COMMAND:
+        bank = value >> 30;
+        if (!(value & BIT(7)) || bank >= ARRAY_SIZE(s->output_queue)) {
+            qemu_log_mask(LOG_UNIMP, "s5l8702-jpeg: output command 0x%08x\n",
+                          (uint32_t)value);
+            break;
+        }
+        for (unsigned i = 0; i < s->output_count; i++) {
+            if (s->output_queue[i] == bank) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "s5l8702-jpeg: output bank already armed\n");
+                return;
+            }
+        }
+        s->output_address[bank] = s->output_base[bank];
+        s->output_queue[s->output_count++] = bank;
+        break;
+    /* Acknowledgements and setup for sub-engines not yet implemented. */
+    case 0x0000c:
+    case 0x0001c:
+    case 0x0002c:
+    case 0x10000:
+    case 0x30100:
+    case 0x30104:
+    case 0x30110:
+    case 0x41804:
+    case 0x41810:
+    case 0x50000:
+    case 0x50010:
         break;
     default:
-        /* The firmware writes to many additional offsets to drive the
-         * real hardware's block-decode FSM. They have no effect on our
-         * full-decode-and-stage emulation. */
-        qemu_log_mask(LOG_UNIMP,
-                      "%s: unimplemented write (offset 0x%05x, value 0x%08x)\n",
-                      __func__, (uint32_t)offset, (uint32_t)val);
+        qemu_log_mask(LOG_UNIMP, "s5l8702-jpeg: write at 0x%" HWADDR_PRIx
+                      " value 0x%08x\n", offset, (uint32_t)value);
         break;
     }
 }
 
-static const MemoryRegionOps s5l8702_jpeg_ops = {
-    .read = s5l8702_jpeg_read,
-    .write = s5l8702_jpeg_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+static const MemoryRegionOps jpeg_ops = {
+    .read = jpeg_read,
+    .write = jpeg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
 };
 
-static void s5l8702_jpeg_reset(DeviceState *dev)
-{
-    S5L8702JpegState *s = S5L8702_JPEG(dev);
-
-    s5l8702_jpeg_drop_cache(s);
-    memset(s->qtable1, 0, sizeof(s->qtable1));
-    memset(s->qtable2, 0, sizeof(s->qtable2));
-    s->coeff_base = 0;
-    s->out_y_addr = 0;
-    s->out_cb_addr = 0;
-    s->out_cr_addr = 0;
-
-    s5l8702_jpeg_build_idct_basis();
-}
-
-static void s5l8702_jpeg_init(Object *obj)
+static void jpeg_reset_enter(Object *obj, ResetType type)
 {
     S5L8702JpegState *s = S5L8702_JPEG(obj);
 
-    memory_region_init_io(&s->iomem, obj, &s5l8702_jpeg_ops, s,
+    memset(s->qtable, 0, sizeof(s->qtable));
+    s->irq_mask = s->config = s->dma_status = s->dma_mask = 0;
+    s->dma_control = s->dma_config = 0;
+    s->input_base = s->input_end = s->input_cursor = 0;
+    memset(s->output_base, 0, sizeof(s->output_base));
+    memset(s->output_address, 0, sizeof(s->output_address));
+    memset(s->output_queue, 0, sizeof(s->output_queue));
+    s->layout = s->command = 0;
+    s->output_count = s->block_in_pair = 0;
+    s->pending = false;
+}
+
+static void jpeg_reset_hold(Object *obj)
+{
+    jpeg_update_irq(S5L8702_JPEG(obj));
+}
+
+static int jpeg_post_load(void *opaque, int version_id)
+{
+    S5L8702JpegState *s = opaque;
+    unsigned seen = 0;
+
+    if (s->output_count > 3 || s->block_in_pair > 1 ||
+        (!s->output_count && s->block_in_pair)) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < s->output_count; i++) {
+        unsigned bank = s->output_queue[i];
+        if (bank >= 3 || (seen & BIT(bank))) {
+            return -EINVAL;
+        }
+        seen |= BIT(bank);
+    }
+    jpeg_update_irq(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_jpeg = {
+    .name = TYPE_S5L8702_JPEG,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = jpeg_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32_2DARRAY(qtable, S5L8702JpegState, 2, 64),
+        VMSTATE_UINT32(irq_mask, S5L8702JpegState),
+        VMSTATE_UINT32(config, S5L8702JpegState),
+        VMSTATE_UINT32(dma_status, S5L8702JpegState),
+        VMSTATE_UINT32(dma_mask, S5L8702JpegState),
+        VMSTATE_UINT32(dma_control, S5L8702JpegState),
+        VMSTATE_UINT32(dma_config, S5L8702JpegState),
+        VMSTATE_UINT32(input_base, S5L8702JpegState),
+        VMSTATE_UINT32(input_end, S5L8702JpegState),
+        VMSTATE_UINT32(input_cursor, S5L8702JpegState),
+        VMSTATE_UINT32_ARRAY(output_base, S5L8702JpegState, 3),
+        VMSTATE_UINT32_ARRAY(output_address, S5L8702JpegState, 3),
+        VMSTATE_UINT32(layout, S5L8702JpegState),
+        VMSTATE_UINT32(command, S5L8702JpegState),
+        VMSTATE_UINT8_ARRAY(output_queue, S5L8702JpegState, 3),
+        VMSTATE_UINT8(output_count, S5L8702JpegState),
+        VMSTATE_UINT8(block_in_pair, S5L8702JpegState),
+        VMSTATE_BOOL(pending, S5L8702JpegState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void jpeg_init(Object *obj)
+{
+    S5L8702JpegState *s = S5L8702_JPEG(obj);
+
+    memory_region_init_io(&s->iomem, obj, &jpeg_ops, s,
                           TYPE_S5L8702_JPEG, S5L8702_JPEG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
-static void s5l8702_jpeg_class_init(ObjectClass *klass, void *data)
+static void jpeg_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
-    dc->reset = s5l8702_jpeg_reset;
+    dc->desc = "S5L8702 JPEG block processor";
+    dc->user_creatable = false;
+    dc->vmsd = &vmstate_jpeg;
+    rc->phases.enter = jpeg_reset_enter;
+    rc->phases.hold = jpeg_reset_hold;
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    jpeg_build_basis();
 }
 
-static const TypeInfo s5l8702_jpeg_types[] = {
-    {
-        .name          = TYPE_S5L8702_JPEG,
-        .parent        = TYPE_SYS_BUS_DEVICE,
-        .instance_init = s5l8702_jpeg_init,
-        .instance_size = sizeof(S5L8702JpegState),
-        .class_init    = s5l8702_jpeg_class_init,
-    },
+static const TypeInfo jpeg_info = {
+    .name = TYPE_S5L8702_JPEG,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(S5L8702JpegState),
+    .instance_init = jpeg_init,
+    .class_init = jpeg_class_init,
 };
-DEFINE_TYPES(s5l8702_jpeg_types);
+
+static void jpeg_register_types(void)
+{
+    type_register_static(&jpeg_info);
+}
+type_init(jpeg_register_types)

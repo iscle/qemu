@@ -406,6 +406,10 @@ s5l8702_clickwheel_access(bool write, uint64_t offset, uint32_t value) "write=%d
 
 s5l8702_disp_access(bool write, uint64_t offset, uint32_t value) "write=%d offset=0x%03" PRIx64 " value=0x%08x"
 
+# s5l8702-jpeg.c
+s5l8702_jpeg_write(uint64_t offset, uint32_t value) "offset=0x%05" PRIx64 " value=0x%08x"
+s5l8702_jpeg_block(uint32_t input, uint64_t output, uint32_t command, unsigned bank, unsigned block) "input=0x%08x output=0x%08" PRIx64 " command=0x%08x bank=%u block=%u"
+
 # s5l8702-i2s.c
 s5l8702_i2s_frame(uint32_t frame, uint64_t samples) "frame=0x%08x samples=%" PRIu64
 s5l8702_cs42l55_frame(uint32_t frame, uint64_t frames) "frame=0x%08x frames=%" PRIu64
