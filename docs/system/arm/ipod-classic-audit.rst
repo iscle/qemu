@@ -721,6 +721,12 @@ The diagnostic's configuration routines ``0x08009758`` / ``0x0800a928``
 also write IICCON bit 6 and bits 3:0 from separate parameters, but do not
 establish their frequency formula. Writes to the additional ``+0x28``
 register are visible there; this register remains unimplemented.
+Their caller, diagnostic ``0x08012b58``, supplies clock-select value 1 and
+divider field 15, producing ``IICCON=0xcf`` with ``+0x14`` and ``+0x28``
+both zero. This was checked by decompilation and the original ARM stores
+at ``0x08012b68..0x08012b90``. The caller supplies constants rather than a
+requested bus frequency, so this second configuration does not establish
+the prescale or divider formula either.
 
 Both controllers now consume gated QEMU clock inputs. An address, write
 or read waits while disabled; gating during a byte preserves its remaining
