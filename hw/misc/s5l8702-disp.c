@@ -142,7 +142,8 @@ static bool disp_draw_window(S5L8702DispState *s, unsigned window,
 {
     unsigned base = WINDOW_BASE + window * WINDOW_STEP;
     uint32_t stride = REG(s, base);
-    unsigned fmt = (REG(s, base + 4) >> 8) & 0xff;
+    uint32_t config = REG(s, base + 4);
+    unsigned fmt = (config >> 8) & 0xff;
     hwaddr src = REG(s, base + 8);
     uint32_t size = REG(s, base + 12);
     uint32_t pos = REG(s, base + 20);
@@ -156,6 +157,14 @@ static bool disp_draw_window(S5L8702DispState *s, unsigned window,
     }
     if (fmt == 3) {
         bpp = 2;
+        /*
+         * 0x08143978..0x081439f4 aligns the source down to a word and
+         * stores the starting nibble in config[2:0]. For RGB565, bit 2
+         * selects the second halfword when the crop starts at an odd x.
+         */
+        if (config & BIT(2)) {
+            src += 2;
+        }
     } else if (fmt == 6 || fmt == 7) {
         bpp = 4;
     } else {

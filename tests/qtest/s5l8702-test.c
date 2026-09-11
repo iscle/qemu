@@ -2731,6 +2731,80 @@ static void test_display(void)
     qtest_quit(q);
 }
 
+static void test_display_rgb565_crop(void)
+{
+    QTestState *q = start();
+    const uint16_t pixels[16] = {
+        0xffff, 0xffff, 0x001f, 0xf800, 0x07e0, 0x07ff, 0xf81f, 0xffe0,
+        0xffff, 0xffff, 0x001f, 0xffe0, 0xf81f, 0x07e0, 0x07ff, 0xf800,
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(pixels); i++) {
+        qtest_writew(q, 0x08010000 + i * 2, pixels[i]);
+    }
+    qtest_writel(q, DISP + 0xd8, 0x10000000);
+    qtest_writel(q, DISP + 0xe0, 0x10000000);
+    qtest_writel(q, DISP + 0xe8, 0x10000000);
+    lcd_command(q, 0x11);
+    lcd_command(q, 0x29);
+    qtest_writel(q, LCD + 0x70, 1);
+    qtest_writel(q, LCD + 0x80, 1);
+
+    for (unsigned window = 0; window < 5; window++) {
+        uint32_t base = DISP + 0x58 + window * 0x18;
+
+        /*
+         * retailOS 0x081436dc: a 3x2 crop at source column 3 uses the
+         * word containing column 2 and a four-nibble starting offset.
+         */
+        qtest_writel(q, DISP + 0x08, 1u << (6 - window));
+        qtest_writel(q, base, 16);
+        qtest_writel(q, base + 4, 0x02010304);
+        qtest_writel(q, base + 8, 0x08010004);
+        qtest_writel(q, base + 12, 0x00030002);
+        qtest_writel(q, base + 16, 2);
+        qtest_writel(q, base + 20, 0x00020003);
+        lcd_command(q, 0x2c);
+        lcd_assert_pixel(q, 2, 3, 248, 0, 0);
+        lcd_assert_pixel(q, 3, 3, 0, 252, 0);
+        lcd_assert_pixel(q, 4, 3, 0, 252, 248);
+        lcd_assert_pixel(q, 2, 4, 248, 252, 0);
+        lcd_assert_pixel(q, 3, 4, 248, 0, 248);
+        lcd_assert_pixel(q, 4, 4, 0, 252, 0);
+
+        /* The same word address also represents an even-column crop. */
+        qtest_writel(q, base + 4, 0x03010300);
+        lcd_command(q, 0x2c);
+        lcd_assert_pixel(q, 2, 3, 0, 0, 248);
+        lcd_assert_pixel(q, 3, 3, 248, 0, 0);
+        lcd_assert_pixel(q, 4, 3, 0, 252, 0);
+
+        /* Panel clipping advances from the cropped source, on both axes. */
+        qtest_writel(q, base + 4, 0x02010304);
+        qtest_writel(q, base + 20, 0xffffffff);
+        lcd_command(q, 0x2c);
+        lcd_assert_pixel(q, 0, 0, 248, 0, 248);
+        lcd_assert_pixel(q, 1, 0, 0, 252, 0);
+        lcd_assert_pixel(q, 2, 0, 0, 0, 0);
+    }
+
+    /* Cropping may select the final RAM halfword, but cannot overread it. */
+    qtest_writel(q, DISP + 0x08, 0x40);
+    qtest_writel(q, DISP + 0x5c, 0x03010304);
+    qtest_writel(q, DISP + 0x60, 0x0bfffffc);
+    qtest_writel(q, DISP + 0x64, 0x00010001);
+    qtest_writel(q, DISP + 0x68, 1);
+    qtest_writel(q, DISP + 0x6c, 0);
+    qtest_writew(q, 0x0bfffffe, 0xf800);
+    lcd_command(q, 0x2c);
+    lcd_assert_pixel(q, 0, 0, 248, 0, 0);
+    qtest_writew(q, 0x0bfffffe, 0x07e0);
+    qtest_writel(q, DISP + 0x64, 0x00020001);
+    lcd_command(q, 0x2c);
+    lcd_assert_pixel(q, 0, 0, 248, 0, 0);
+    qtest_quit(q);
+}
+
 static void test_lcd_te(void)
 {
     QTestState *q = start();
@@ -3201,6 +3275,7 @@ int main(int argc, char **argv)
     qtest_add_func("/s5l8702/sha", test_sha);
     qtest_add_func("/s5l8702/sha-dma", test_sha_dma);
     qtest_add_func("/s5l8702/display", test_display);
+    qtest_add_func("/s5l8702/display-rgb565-crop", test_display_rgb565_crop);
     qtest_add_func("/s5l8702/lcd-bounds", test_lcd_bounds);
     qtest_add_func("/s5l8702/lcd-te", test_lcd_te);
     qtest_add_func("/s5l8702/gpio-irq", test_gpio_irq);

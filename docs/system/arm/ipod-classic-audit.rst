@@ -75,8 +75,20 @@ The reproduced Settings -> About transition now keeps its gradient.
 Captures in ``ipod-work/panel-te-about/`` show the actual guest output after
 the GPIO/TE fix. Peak dark pixels in the measured content rectangle fell
 from 45,304 to 1,483 (text in the starting Settings screen); the large black
-background is gone. Other menus, exact color rounding/filtering, overlapping
-windows within the multi-window group, and cursor priority need more tests.
+background is gone.
+
+Further original-input captures in ``ipod-work/display-transitions/fixed-*/``
+cover entering/leaving Music and Cover Flow, entering Settings, and entering
+About. Each sequence contains 100 host screenshots over approximately
+3.5--3.8 seconds. None shows the former large black rectangle; peak dark
+pixel counts in the same content rectangle are 1,367 for the Music/Cover
+Flow paths, 1,503 for Settings, and 1,483 for About. These counts include
+menu text. The private media fixture has one generated PCM track without
+cover artwork, so this does not validate artwork loading. Host screenshots
+can miss guest frames; asynchronously sampled display registers are not an
+atomic record of each image. Other menus, exact color rounding/filtering,
+overlapping windows within the multi-window group, and cursor priority
+still need more tests.
 
 2. Game launch failure
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -270,6 +282,19 @@ implemented. Packed formats 0, 1, 2, 4, and 5, interlaced/packed YUV formats
 9 and 10, palette, gamma, color-matrix programming, rotation, and scaler
 filter coefficients remain unsupported. A failed DMA read preserves the
 previous panel frame instead of committing a partial composition.
+
+**RGB565 source cropping corrected.** Original routine ``0x081436dc``,
+specifically ``0x08143978..0x081439f4``, splits a source crop between a
+word-aligned address and the format register's starting-nibble field in
+bits 2:0. For format 3, an odd source column sets bit 2 to skip the first
+halfword. The compositor previously ignored that field, displaying the
+preceding pixel and shifting every cropped row by one pixel. It now applies
+the halfword offset before clipping to the panel. The new qtest fails on
+the previous model and passes for all five windows, checking odd/even
+source columns, row strides, clipping on both axes, and a crop at the end
+of RAM. An overlong DMA read still preserves the previous panel frame.
+This fixes a source-addressing omission; it does not establish the remaining
+packed-format meanings, DMA padding/burst behavior, or reserved-bit behavior.
 
 The fixed 320x240 panel has bounded GRAM, window addressing, sleep/display
 blanking, and vertical TE signalling. PIO pixels remain RGB565-only; panel
@@ -1472,7 +1497,7 @@ Local audit evidence and next steps
 
 The audit VM used the normal launcher with ``-snapshot`` so game attempts
 and navigation did not write back to the restored disk/NOR. Ghidra was run
-one process at a time. Peripheral builds use ``ninja -j2``; all seventy-two
+one process at a time. Peripheral builds use ``ninja -j2``; all seventy-three
 current qtests pass.
 
 The paths below identify local investigation artifacts in the surrounding
@@ -1500,6 +1525,15 @@ submission changes were checked against the original firmware and the
 normal ROM/NOR/OS boot. The reported About background failure is fixed in
 the reproduced path. Game verification and decryption now succeed; the
 separate damaged-image condition is described in item 2.
+
+RGB565 crop evidence is in ``ipod-work/display-transitions/``:
+``original-display.c`` and ``crop-disassembly.txt`` contain the original
+firmware's address/offset calculation; ``crop-before.log`` records the
+regression test failing on the previous compositor. ``full-qtest.log``
+records all seventy-three passing tests after the fix. ``fixed-main.png``
+shows a fresh boot of the original-input disk to the normal UI;
+``original-input.txt`` records the unchanged firmware hash and damaged
+library marker. These tests used ``-snapshot`` and a silent audio backend.
 
 Game/SHA evidence includes ``ipod-work/game-digest-reconstruction.log``,
 ``game-verifier-after-sha.log``, ``sha-dma-driver.c``,
