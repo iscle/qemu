@@ -1219,9 +1219,77 @@ and has unsupported commands that call ``hw_error``. ECC reports immediate
 success and raises completion without calculating error-correction data.
 These NAND paths are not needed for the demonstrated ATA boot.
 
-UARTs reuse the Exynos4210 model. Dock/accessory protocols, serial timing,
-headphone insertion events, remote controls, and accessory detection have
-not been validated against the local firmware and connected hardware models.
+The UARTs now use a separate S5L8702 device. The earlier iPod-specific
+UTRSTAT changes have been removed from the shared Exynos4210 model. Original
+retailOS ``0x08363120`` selects four ports at ``0x3cc00000 + port * 0x4000``;
+the updater diagnostic initializer ``0x08018620`` initializes those same
+four ports. Its generic table contains a fifth descriptor, but that alone
+does not establish a fifth physical UART. The unsupported fifth Exynos
+instance and the dependency on ``CONFIG_EXYNOS4`` are gone.
+
+The register interface is based on the following original firmware
+decompilation and disassembly:
+
+* retailOS ``0x080b0b14`` waits for ``UFSTAT & 0x2f0`` to become zero before
+  writing at most 16 bytes. The updater RX handler ``0x0801a274`` decodes
+  a low four-bit count and adds 16 for bit 8. The model has bounded 16-byte
+  RX/TX queues and separate full flags in bits 8/9.
+* Updater ``0x0801b270`` and ``0x0801b384`` enable RX/TX interrupts with
+  UCON bits 12/13. retailOS ``0x08362f50`` loops over ``UTRSTAT & 0x178``
+  and acknowledges events by writing the corresponding status bits.
+  Acknowledgement now clears the latched event without an immediate
+  reassertion merely because unread data remains. Reading RX data does
+  not substitute for acknowledging the interrupt.
+* Updater ``0x0801b42c`` programs the RX/TX trigger fields in UFCON bits
+  4/6 and resets the queues with bits 1/2. The model makes the reset bits
+  self-clear, consistent with the related S5L8700 register description.
+* retailOS ``0x08362f50`` treats status bit ``0x100`` as automatic baud
+  detection, reads its count at ``+0x2c``, and writes baud/fine-tuning
+  registers at ``+0x28/+0x34/+0x38``. The latter two retain values such as
+  ``0x000cc330``; they are not Exynos interrupt-pending/mask registers.
+* Updater ``0x0801ab30`` enables gate ``0x27`` through ``0x08005e10`` and
+  ``0x080164f4``, clearing PWRCON1 bit 9. The modeled gate now stops byte
+  delivery and resumes queued TX data when opened.
+
+**UART timing and accessory support are still incomplete.** There is no
+baud-clock serializer, separate TX shift register, RX timeout event,
+autobaud edge detector, modem-pin model, DMA request interface or infrared
+mode. UBRDIV and the fine-tuning registers are storage only. This replacement
+removes the Exynos timeout calculation that incorrectly interpreted UCON's
+interrupt enables as a timeout length and used an unrelated fixed 24 MHz
+clock; it does not claim that receive timeouts have been implemented.
+TX drains when the character backend accepts bytes. A nonblocking write and
+writable watch replace ``qemu_chr_fe_write_all``, so a stalled backend cannot
+block QEMU's main loop, but host backpressure still changes guest-visible
+TX occupancy. This is a remaining timing workaround. Without a connected
+backend, TX data is discarded. RX bytes arrive at backend speed; the model
+uses backend backpressure rather than physical wire overruns.
+
+The one-byte non-FIFO mode, loopback, reset defaults/self-clearing bits,
+exact trigger levels
+(RX 4/8/12/16 and TX 0/4/8/12), and interrupt generation at a FIFO threshold
+remain inferred from the related S5L8700 UART and corroborating Rockbox
+`UC87xx driver
+<https://github.com/Rockbox/rockbox/blob/master/firmware/export/uc87xx.h>`_,
+rather than measurements of this S5L8702. Firmware confirms
+the register fields above, but does not prove every behavior on arbitrary
+access sequences. Per-byte error FIFOs, parity/framing errors, FIFO mode
+changes with queued data, reserved-bit masks and narrower MMIO accesses
+need further investigation. Overrun/break status is currently a single
+read-to-clear latch. GPIO pin multiplexing is not connected to this UART.
+
+Five qtests cover all four port IRQ routes, masked events, the original
+ISR's acknowledge-before-drain order, FIFO capacity and retained data on
+loopback overrun, the clock gate, snapshot/reset state, ring-buffer backend
+output, and a prefilled socket backend. The socket case verifies main-loop
+responsiveness under backpressure, bounded TX storage, subsequent ordered
+delivery and real backend RX. These are model regressions, not physical
+UART timing or dock protocol validation. Device state uses Resettable and VMState with
+bounded migration indices; whole-machine migration remains unverified.
+Snapshots containing the former Exynos UART instances are incompatible
+with this replacement.
+Dock/accessory protocols, headphone insertion events, remote controls and
+accessory detection have not been validated with connected hardware models.
 
 QEMU engineering and validation debt
 ------------------------------------
@@ -1368,7 +1436,7 @@ Local audit evidence and next steps
 
 The audit VM used the normal launcher with ``-snapshot`` so game attempts
 and navigation did not write back to the restored disk/NOR. Ghidra was run
-one process at a time. Peripheral builds use ``ninja -j2``; all sixty-three
+one process at a time. Peripheral builds use ``ninja -j2``; all sixty-eight
 current qtests pass.
 
 The paths below identify local investigation artifacts in the surrounding

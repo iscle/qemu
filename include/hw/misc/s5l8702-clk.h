@@ -31,6 +31,7 @@ struct S5L8702ClkState {
     Clock *i2c_pclk[2];
     Clock *codec_mclk;
     Clock *i2s_pclk;
+    Clock *uart_pclk;
 };
 
 #endif /* HW_MISC_S5L8702_CLK_H */

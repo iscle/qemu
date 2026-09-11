@@ -5,6 +5,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qemu/bswap.h"
+#include "qemu/sockets.h"
 
 #define VIC0 0x38e00000
 #define VIC1 0x38e01000
@@ -19,6 +20,7 @@
 #define I2S0 0x3ca00000
 #define DMA0 0x38200000
 #define SM1 0x38500000
+#define UART0 0x3cc00000
 
 static char *rom, *nor, *disk;
 
@@ -104,6 +106,225 @@ static void test_vic_cascade(void)
     g_assert_true(qtest_get_irq(q, 1));
     qtest_writel(q, VIC0 + 0x1c, 2);
     g_assert_false(qtest_get_irq(q, 1));
+    qtest_quit(q);
+}
+
+/* The original retailOS ISR loops until UTRSTAT & 0x178 becomes zero. */
+static void test_uart_registers(void)
+{
+    QTestState *q = start();
+
+    qtest_irq_intercept_in(q, "/machine/soc/cpu");
+    qtest_writel(q, VIC0 + 0x10, 0x0f000000);
+    for (unsigned port = 0; port < 4; port++) {
+        uint32_t base = UART0 + port * 0x4000;
+
+        g_assert_cmphex(qtest_readl(q, base + 0x10), ==, 6);
+        qtest_writel(q, base, 3);
+        qtest_writel(q, base + 8, 7);
+        g_assert_cmphex(qtest_readl(q, base + 8), ==, 1);
+        qtest_writel(q, base + 0x28, 0xc);
+        qtest_writel(q, base + 0x34, 0xcc330);
+        qtest_writel(q, base + 0x38, 0xcc330);
+        g_assert_cmphex(qtest_readl(q, base + 0x34), ==, 0xcc330);
+        g_assert_cmphex(qtest_readl(q, base + 0x38), ==, 0xcc330);
+        /* UCON RX IRQ enable and loopback, with TX IRQ masked. */
+        qtest_writel(q, base + 4, 0x1025);
+        for (unsigned i = 0; i < 3; i++) {
+            qtest_writel(q, base + 0x20, 'a' + i);
+        }
+        g_assert_false(qtest_get_irq(q, 0));
+        qtest_writel(q, base + 0x20, 'd');
+        g_assert_cmphex(qtest_readl(q, VIC0 + 8), ==, 1U << (24 + port));
+        g_assert_true(qtest_get_irq(q, 0));
+        g_assert_cmphex(qtest_readl(q, base + 0x10) & 0x178, ==, 0x30);
+        /* W1C before draining must terminate the original ISR's loop. */
+        qtest_writel(q, base + 0x10, 0x30);
+        g_assert_cmphex(qtest_readl(q, base + 0x10) & 0x178, ==, 0);
+        g_assert_false(qtest_get_irq(q, 0));
+        g_assert_cmphex(qtest_readl(q, base + 0x18), ==, 4);
+        for (unsigned i = 0; i < 4; i++) {
+            g_assert_cmphex(qtest_readl(q, base + 0x24), ==, 'a' + i);
+        }
+        g_assert_cmphex(qtest_readl(q, base + 0x10), ==, 6);
+    }
+    qtest_quit(q);
+}
+
+static void test_uart_fifo(void)
+{
+    QTestState *q = start();
+
+    qtest_irq_intercept_in(q, "/machine/soc/cpu");
+    qtest_writel(q, VIC0 + 0x10, 1U << 24);
+    qtest_writel(q, UART0 + 8, 0x37); /* 16-byte RX trigger, reset both. */
+    qtest_writel(q, UART0 + 4, 0x25); /* Interrupts masked. */
+    for (unsigned i = 0; i < 16; i++) {
+        qtest_writel(q, UART0 + 0x20, 0x40 + i);
+    }
+    /* Original diagnostic decodes low four bits plus bit 8 as 16 bytes. */
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x100);
+    g_assert_false(qtest_get_irq(q, 0));
+    qtest_writel(q, UART0 + 4, 0x1025);
+    g_assert_true(qtest_get_irq(q, 0));
+    /* Overrun must preserve unread data. */
+    qtest_writel(q, UART0 + 0x20, 0xff);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x14), ==, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x14), ==, 0);
+    qtest_writel(q, UART0 + 0x10, 0x178);
+    g_assert_false(qtest_get_irq(q, 0));
+    for (unsigned i = 0; i < 16; i++) {
+        g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 0x40 + i);
+    }
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0);
+    /* Non-FIFO mode preserves its one unread byte on overrun. */
+    qtest_writel(q, UART0 + 8, 6);
+    qtest_writel(q, UART0 + 0x20, 'x');
+    qtest_writel(q, UART0 + 0x20, 'y');
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x14), ==, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'x');
+    qtest_quit(q);
+}
+
+static void test_uart_gate_state(void)
+{
+    QTestState *q = start();
+    g_autofree char *result = NULL;
+    uint32_t gates = qtest_readl(q, CLK + 0x4c);
+
+    qtest_writel(q, UART0 + 8, 7);
+    qtest_writel(q, UART0 + 4, 0x1025);
+    qtest_writel(q, CLK + 0x4c, gates | 0x200);
+    for (unsigned i = 0; i < 17; i++) {
+        qtest_writel(q, UART0 + 0x20, 0x60 + i);
+    }
+    /* Bounded TX storage while the confirmed UART block gate is closed. */
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10), ==, 0);
+    qtest_clock_step(q, 1000000000);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
+    result = qtest_hmp(q, "savevm uart-gated");
+    g_assert_cmpstr(result, ==, "");
+    g_clear_pointer(&result, g_free);
+    qtest_writel(q, UART0 + 8, 7);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0);
+    result = qtest_hmp(q, "loadvm uart-gated");
+    g_assert_cmpstr(result, ==, "");
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
+    qtest_writel(q, CLK + 0x4c, gates);
+    /* A BH drains the provisional backend-driven TX when its gate opens. */
+    for (unsigned i = 0; i < 100; i++) {
+        if (qtest_readl(q, UART0 + 0x18) == 0x100) {
+            break;
+        }
+        qtest_clock_step(q, 1);
+    }
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x100);
+    for (unsigned i = 0; i < 16; i++) {
+        g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 0x60 + i);
+    }
+    qtest_writel(q, UART0 + 0x20, 'z');
+    qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+    g_assert_cmphex(qtest_readl(q, UART0 + 4), ==, 0);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10), ==, 6);
+    qtest_quit(q);
+}
+
+static void test_uart_backend(void)
+{
+    QTestState *q = start_with_args("-chardev ringbuf,id=uart-log,size=64 "
+                                    "-serial chardev:uart-log");
+    QDict *response;
+
+    qtest_writel(q, UART0 + 8, 7);
+    qtest_writel(q, UART0 + 4, 5);
+    for (unsigned i = 0; i < 4; i++) {
+        qtest_writel(q, UART0 + 0x20, 'a' + i);
+    }
+    response = qtest_qmp(q, "{'execute':'ringbuf-read','arguments':"
+                           "{'device':'uart-log','size':64}}");
+    g_assert_cmpstr(qdict_get_str(response, "return"), ==, "abcd");
+    qobject_unref(response);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0);
+    qtest_quit(q);
+}
+
+static void test_uart_backpressure(void)
+{
+    int pair[2], sent, total = 0, capacity = 4096;
+    uint8_t buffer[256] = { 0 };
+    QTestState *q;
+    g_autofree char *args = NULL;
+
+    g_assert_cmpint(qemu_socketpair(AF_UNIX, SOCK_STREAM, 0, pair), ==, 0);
+    /* Only the UART endpoint is inherited by the QEMU child. */
+    g_assert_cmpint(fcntl(pair[1], F_SETFD, 0), ==, 0);
+    qemu_socket_set_nonblock(pair[0]);
+    qemu_socket_set_nonblock(pair[1]);
+    g_assert_cmpint(setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF,
+                             &capacity, sizeof(capacity)), ==, 0);
+    /* Fill the host socket before attaching it, so the first TX must wait. */
+    while ((sent = send(pair[1], buffer, sizeof(buffer), 0)) > 0) {
+        total += sent;
+        g_assert_cmpint(total, <, 65536);
+    }
+    g_assert_true(errno == EAGAIN || errno == EWOULDBLOCK);
+    g_assert_cmpint(total, >, 0);
+    args = g_strdup_printf("-chardev socket,id=uart-stall,fd=%d "
+                           "-serial chardev:uart-stall", pair[1]);
+    q = start_with_args(args);
+    close(pair[1]);
+    qtest_writel(q, UART0 + 8, 7);
+    qtest_writel(q, UART0 + 4, 5);
+    for (unsigned i = 0; i < 17; i++) {
+        qtest_writel(q, UART0 + 0x20, 'a' + i);
+    }
+    /* The monitor remains responsive and the guest queue stops at 16. */
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
+    qtest_clock_step(q, 1000000000);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
+    while (total) {
+        int got = recv(pair[0], buffer, MIN(total, sizeof(buffer)), 0);
+
+        g_assert_cmpint(got, >, 0);
+        for (int i = 0; i < got; i++) {
+            g_assert_cmphex(buffer[i], ==, 0);
+        }
+        total -= got;
+    }
+    for (unsigned i = 0; i < 16; i++) {
+        int got = -1;
+
+        for (unsigned retry = 0; retry < 100; retry++) {
+            got = recv(pair[0], buffer, 1, 0);
+            if (got == 1) {
+                break;
+            }
+            g_assert_cmpint(got, ==, -1);
+            g_assert_true(errno == EAGAIN || errno == EWOULDBLOCK);
+            qtest_clock_step(q, 1);
+        }
+        g_assert_cmpint(got, ==, 1);
+        g_assert_cmphex(buffer[0], ==, 'a' + i);
+    }
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0);
+    /* The real backend receive path must honor the same RX threshold. */
+    qtest_writel(q, UART0 + 0x10, 0x178);
+    qtest_writel(q, UART0 + 4, 0x1005);
+    g_assert_cmpint(send(pair[0], "wxyz", 4, 0), ==, 4);
+    for (unsigned i = 0; i < 100; i++) {
+        if (qtest_readl(q, UART0 + 0x18) == 4) {
+            break;
+        }
+        qtest_clock_step(q, 1);
+    }
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 0x178, ==, 0x10);
+    qtest_writel(q, UART0 + 0x10, 0x10);
+    for (unsigned i = 0; i < 4; i++) {
+        g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'w' + i);
+    }
+    close(pair[0]);
     qtest_quit(q);
 }
 
@@ -2707,6 +2928,11 @@ int main(int argc, char **argv)
     disk = empty_image("s5l-disk-XXXXXX", 16 * 1024 * 1024);
     qtest_add_func("/s5l8702/vic/priority", test_vic);
     qtest_add_func("/s5l8702/vic/cascade", test_vic_cascade);
+    qtest_add_func("/s5l8702/uart/registers", test_uart_registers);
+    qtest_add_func("/s5l8702/uart/fifo", test_uart_fifo);
+    qtest_add_func("/s5l8702/uart/gate-state", test_uart_gate_state);
+    qtest_add_func("/s5l8702/uart/backend", test_uart_backend);
+    qtest_add_func("/s5l8702/uart/backpressure", test_uart_backpressure);
     qtest_add_func("/s5l8702/i2s-stop", test_i2s_stop);
     qtest_add_func("/s5l8702/i2c", test_i2c);
     qtest_add_func("/s5l8702/i2c-stop", test_i2c_stop);

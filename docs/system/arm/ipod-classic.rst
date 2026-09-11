@@ -427,7 +427,7 @@ They exercise I2C byte sequencing, MIU remap, timer reload/acknowledgement,
 clickwheel FIFO semantics, DMA bounds, GPIO register width, PL192 priority
 and cascade handling, AES CBC known vectors for all three key sizes, and
 SHA compression/IRQ behavior including more than 1 MiB of streamed blocks.
-The sixty-three tests also cover planar/alpha composition, panel GRAM and
+The sixty-eight tests also cover planar/alpha composition, panel GRAM and
 window bounds, GPIO interrupt polarity/masking/acknowledgement, the panel
 TE route, multi-block SHA DMA, and hash context save/restore. PMU cases
 cover hold changes, deferred RTC writes, calendar rollover, retained RTC/GPM
@@ -458,6 +458,12 @@ across gating/rate changes and snapshots with queued data. PL080 cases exercise
 all nine supported width combinations, fixed/incrementing addresses,
 descriptor interrupt ordering, LLI bus selection, bus-error handling,
 reserved widths, unsupported flow modes, reset and snapshot IRQ state.
+The UART regressions cover the four S5L port IRQ routes, 16-byte FIFO
+status, UCON masking, UTRSTAT acknowledgement before draining RX data,
+clock gating, reset and snapshot restoration, and character-backend output.
+The UART now has a separate S5L device; baud timing, receive timeout,
+autobaud detection and dock/accessory protocols remain unimplemented.
+
 The SM1 regression checks that I2S serialization cannot change its memory
 descriptors; their placeholder values are not asserted as hardware defaults.
 The upper-control case reproduces the original firmware's divider readback

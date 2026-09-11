@@ -150,6 +150,9 @@ static void s5l8702_clk_update(S5L8702ClkState *s, bool propagate)
 
         set_clock_rate(s->i2c_pclk[i], enabled ? pclk : 0, propagate);
     }
+    /* aupd diagnostic 0x0801ab30 -> 0x080164f4: UART block gate 9. */
+    set_clock_rate(s->uart_pclk, REG(s, PWRCON1) & BIT(9) ? 0 : pclk,
+                   propagate);
     trace_s5l8702_clk_rates(cclk, hclk, pclk, eclk, timer_enabled);
 }
 
@@ -270,6 +273,7 @@ static void s5l8702_clk_init(Object *obj)
     s->eclk = qdev_init_clock_out(dev, "eclk");
     s->codec_mclk = qdev_init_clock_out(dev, "codec-mclk");
     s->i2s_pclk = qdev_init_clock_out(dev, "i2s0-pclk");
+    s->uart_pclk = qdev_init_clock_out(dev, "uart-pclk");
     s->timer_pclk = qdev_init_clock_out(dev, "timer-pclk");
     s->timer_eclk = qdev_init_clock_out(dev, "timer-eclk");
     s->spi_pclk[0] = qdev_init_clock_out(dev, "spi0-pclk");

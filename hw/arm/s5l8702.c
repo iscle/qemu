@@ -10,7 +10,7 @@
 #include "hw/qdev-clock.h"
 #include "hw/arm/s5l8702.h"
 #include "hw/misc/unimp.h"
-#include "hw/arm/exynos4210.h"
+#include "hw/qdev-properties-system.h"
 #include "hw/misc/s5l8702-usbotg.h"
 #include "hw/misc/s5l8702-usbphy.h"
 #include "hw/misc/s5l8702-sysic.h"
@@ -64,6 +64,10 @@ static void s5l8702_init(Object *obj) {
 
     for (uint32_t i = 0; i < ARRAY_SIZE(s->i2c); i++) {
         object_initialize_child(obj, "i2c[*]", &s->i2c[i], TYPE_S5L8702_I2C);
+    }
+
+    for (unsigned i = 0; i < ARRAY_SIZE(s->uart); i++) {
+        object_initialize_child(obj, "uart[*]", &s->uart[i], TYPE_S5L8702_UART);
     }
 
     object_initialize_child(obj, "timer", &s->timer, TYPE_S5L8702_TIMER);
@@ -273,17 +277,18 @@ static void s5l8702_realize(DeviceState *dev, Error **errp) {
                                              &s->iram_alias[i], 1);
     }
 
-    /* UART */
-    exynos4210_uart_create(S5L8702_UART0_MEM_BASE, 256, 0, serial_hd(0),
-                           s5l8702_get_irq(s, S5L8702_IRQ_UART0));
-    exynos4210_uart_create(S5L8702_UART1_MEM_BASE, 256, 0, serial_hd(1),
-                           s5l8702_get_irq(s, S5L8702_IRQ_UART1));
-    exynos4210_uart_create(S5L8702_UART2_MEM_BASE, 256, 0, serial_hd(2),
-                           s5l8702_get_irq(s, S5L8702_IRQ_UART2));
-    exynos4210_uart_create(S5L8702_UART3_MEM_BASE, 256, 0, serial_hd(3),
-                           s5l8702_get_irq(s, S5L8702_IRQ_UART3));
-    exynos4210_uart_create(S5L8702_UART4_MEM_BASE, 256, 0, serial_hd(4),
-                           s5l8702_get_irq(s, S5L8702_IRQ_UART4));
+    /* retailOS 0x08363120 selects ports 0..3 at a 0x4000 stride. */
+    for (unsigned i = 0; i < ARRAY_SIZE(s->uart); i++) {
+        DeviceState *uart = DEVICE(&s->uart[i]);
+
+        qdev_prop_set_chr(uart, "chardev", serial_hd(i));
+        qdev_connect_clock_in(uart, "pclk", s->clk.uart_pclk);
+        sysbus_realize(SYS_BUS_DEVICE(uart), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0,
+                        S5L8702_UART0_MEM_BASE + i * 0x4000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
+                           s5l8702_get_irq(s, S5L8702_IRQ_UART0 + i));
+    }
 
     /* MIU */
     sysbus_realize(SYS_BUS_DEVICE(&s->miu), &error_fatal);

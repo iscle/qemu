@@ -28,6 +28,7 @@
 #include "hw/misc/s5l8702-rng.h"
 #include "hw/misc/s5l8702-i2s.h"
 #include "hw/misc/s5l8702-sm1.h"
+#include "hw/char/s5l8702-uart.h"
 #include "hw/dma/pl080.h"
 #include "hw/ide/s5l8702-ata.h"
 
@@ -62,12 +63,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8702State, S5L8702)
 #define S5L8702_UART1_MEM_BASE 0x3CC04000
 #define S5L8702_UART2_MEM_BASE 0x3CC08000
 #define S5L8702_UART3_MEM_BASE 0x3CC0C000
-#define S5L8702_UART4_MEM_BASE 0x3CC10000
 #define S5L8702_IRQ_UART0 24
 #define S5L8702_IRQ_UART1 25
 #define S5L8702_IRQ_UART2 26
 #define S5L8702_IRQ_UART3 27
-#define S5L8702_IRQ_UART4 28
 
 #define S5L8702_IRQ_USBOTG 19  /* VIC0 IRQ 19 (0x13): firmware writes 1<<19 to VIC0 INTENABLE */
 
@@ -113,7 +112,7 @@ struct S5L8702State {
     S5L8702RngState rng;
     S5L8702I2SState i2s;
     S5L8702SM1State sm1;
-    DeviceState* uart[4];
+    S5L8702UartState uart[4];
 };
 
 #endif /* HW_ARM_S5L8702_H */
