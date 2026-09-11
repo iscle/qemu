@@ -14,6 +14,8 @@
 #include "hw/ssi/s5l8702-spi.h"
 #include "hw/i2c/s5l8702-i2c.h"
 #include "hw/misc/s5l8702-lcd.h"
+#include "hw/misc/s5l8702-disp.h"
+#include "hw/misc/s5l8702-tvo.h"
 #include "hw/misc/s5l8702-jpeg.h"
 #include "hw/misc/s5l8702-chipid.h"
 #include "hw/misc/s5l8702-miu.h"
@@ -23,6 +25,9 @@
 #include "hw/misc/s5l8702-usbotg.h"
 #include "hw/misc/s5l8702-usbphy.h"
 #include "hw/misc/s5l8702-sysic.h"
+#include "hw/misc/s5l8702-rng.h"
+#include "hw/misc/s5l8702-i2s.h"
+#include "hw/misc/s5l8702-sm1.h"
 #include "hw/dma/pl080.h"
 #include "hw/ide/s5l8702-ata.h"
 
@@ -49,6 +54,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8702State, S5L8702)
 #define S5L8702_DMA1_BASE 0x39900000
 #define S5L8702_IRQ_DMAC0 16
 #define S5L8702_IRQ_DMAC1 17
+#ifndef S5L8702_IRQ_ATA
+#define S5L8702_IRQ_ATA 29   /* candidate; retailOS ATA completion IRQ */
+#endif
 
 #define S5L8702_UART0_MEM_BASE 0x3CC00000
 #define S5L8702_UART1_MEM_BASE 0x3CC04000
@@ -71,15 +79,14 @@ struct S5L8702State {
 
     /*< public >*/
     ARMCPU cpu;
-    qemu_irq **irq;
+    qemu_irq irq[2][32];
     MemoryRegion brom;          // S5L8702_BOOTROM_BASE_ADDR
     MemoryRegion brom_alias;    // S5L8702_BASE_BOOT_ADDR
+    MemoryRegion iram_alias[2];
     MemoryRegion iram0;         // S5L8702_IRAM0_BASE_ADDR
     MemoryRegion iram1;         // S5L8702_IRAM1_BASE_ADDR
-    PL192State* vic0;
-    PL192State* vic1;
-    Clock pclk;
-    Clock eclk;
+    PL192State vic[2];
+    Clock osc0;
     Clock extclk0;
     Clock extclk1;
     S5L8702ClkState clk;
@@ -90,6 +97,8 @@ struct S5L8702State {
     S5L8702I2cState i2c[2];
     S5L8702TimerCtrlState timer;
     S5L8702LcdState lcd;
+    S5L8702DispState disp;
+    S5L8702TvoState tvo;
     S5L8702JpegState jpeg;
     PL080State dma[2];
     S5L8702AtaState ata;
@@ -101,6 +110,9 @@ struct S5L8702State {
     S5L8702UsbOtgState usbotg;
     S5L8702UsbPhyState usbphy;
     S5L8702SysICState sysic;
+    S5L8702RngState rng;
+    S5L8702I2SState i2s;
+    S5L8702SM1State sm1;
     DeviceState* uart[4];
 };
 

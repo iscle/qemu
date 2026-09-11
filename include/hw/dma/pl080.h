@@ -24,6 +24,9 @@
  * + sysbus MMIO region 0: MemoryRegion for the device's registers
  * + QOM property "downstream": MemoryRegion defining where DMA
  *   bus master transactions are made
+ * + GPIO inputs "dreq-single", "dreq-burst", "dreq-last-single" and
+ *   "dreq-last-burst": 16 peripheral request lines of each type
+ * + GPIO outputs "dreq-clear": 16 DMACCLR handshake lines
  */
 
 #ifndef HW_DMA_PL080_H
@@ -33,6 +36,8 @@
 #include "qom/object.h"
 
 #define PL080_MAX_CHANNELS 8
+#define PL080_NUM_PERIPHERALS 16
+#define PL080_FIFO_BYTES 16
 
 typedef struct {
     uint32_t src;
@@ -41,6 +46,16 @@ typedef struct {
     uint32_t ctrl;
     uint32_t conf;
 } pl080_channel;
+
+typedef struct {
+    uint8_t fifo[PL080_FIFO_BYTES];
+    uint8_t len;
+    uint16_t src_left;
+    uint16_t dst_left;
+    uint8_t src_kind;
+    uint8_t dst_kind;
+    bool started;
+} PL080Transfer;
 
 #define TYPE_PL080 "pl080"
 #define TYPE_PL081 "pl081"
@@ -58,7 +73,15 @@ struct PL080State {
     uint32_t sync;
     uint32_t req_single;
     uint32_t req_burst;
+    uint32_t req_last_single;
+    uint32_t req_last_burst;
+    uint16_t hw_req[4];
+    uint16_t req_ack;
+    uint16_t req_busy;
+    qemu_irq request_clear[PL080_NUM_PERIPHERALS];
     pl080_channel chan[PL080_MAX_CHANNELS];
+    PL080Transfer transfer[PL080_MAX_CHANNELS];
+    QEMUBH *bh;
     int nchannels;
     /* Flag to avoid recursive DMA invocations.  */
     int running;

@@ -36,8 +36,15 @@ static void s5l8702_usbphy_reset(DeviceState *dev) {
     trace_s5l8702_usbphy_reset();
     memset(s->regs, 0, sizeof(s->regs));
 
-    // Uncomment this line to force DFU mode on boot by default
-    // s->regs[10] = 0x00000001;
+    /*
+     * Force DFU mode on boot when IPOD_DFU is set in the environment. The
+     * bootrom reads this PHY register as part of deciding whether to enter DFU
+     * (USB recovery) instead of booting the firmware. Pairs with gpio.pdat[1]
+     * set in the machine init.
+     */
+    if (getenv("IPOD_DFU")) {
+        s->regs[10] = 0x00000001;
+    }
 }
 
 static void s5l8702_usbphy_init(Object *obj) {

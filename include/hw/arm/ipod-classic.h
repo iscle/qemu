@@ -8,6 +8,7 @@
 #include "sysemu/block-backend.h"
 #include "hw/arm/s5l8702.h"
 #include "hw/misc/pcf5063x.h"
+#include "hw/misc/s5l8702-cs42l55.h"
 
 #define TYPE_IPOD_CLASSIC_MACHINE   MACHINE_TYPE_NAME("ipod-classic")
 OBJECT_DECLARE_SIMPLE_TYPE(IpodClassicState, IPOD_CLASSIC_MACHINE)
@@ -21,6 +22,9 @@ struct IpodClassicState {
     MemoryRegion dram;
     MemoryRegion dram_alias;
     Pcf5063xState pcf5063x;
+    S5L8702CS42L55State codec;
+    qemu_irq hold_input;
+    bool hold;
 
     char *bootrom_path;
 };

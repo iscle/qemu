@@ -1,7 +1,8 @@
 #ifndef PL192_H
 #define PL192_H
 
-#include "qemu/osdep.h"
+#include "hw/sysbus.h"
+#include "qom/object.h"
 
 #define TYPE_PL192 "pl192"
 OBJECT_DECLARE_SIMPLE_TYPE(PL192State, PL192)
@@ -9,7 +10,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PL192State, PL192)
 
 #define PL192_INT_SOURCES   32
 #define PL192_DAISY_IRQ     PL192_INT_SOURCES
-#define PL192_NO_IRQ        PL192_INT_SOURCES+1
+#define PL192_NO_IRQ        (PL192_INT_SOURCES + 1)
 #define PL192_PRIO_LEVELS   16
 
 #define PL192_IRQSTATUS         0x00
@@ -26,11 +27,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PL192State, PL192)
 #define PL192_VECTADDR          0xF00
 #define PL192_IOMEM_SIZE        0x1000
 
-#define PL190_ITCR              0x300
-#define PL190_VECTADDR          0x30
-#define PL190_DEFVECTADDR       0x34
 
-#define PL192_IOMEM_SIZE    0x1000
 
 
 struct PL192State {
@@ -57,15 +54,16 @@ struct PL192State {
 
     /* Priority masking logic */
     int32_t stack_i;
-    uint32_t priority_stack[PL192_PRIO_LEVELS+1];
-    uint8_t irq_stack[PL192_PRIO_LEVELS+1];
+    uint32_t priority_stack[PL192_PRIO_LEVELS + 1];
+    uint8_t irq_stack[PL192_PRIO_LEVELS + 1];
     uint32_t priority;
 
     /* Daisy-chain interface */
     uint32_t daisy_vectaddr;
     uint32_t daisy_priority;
     PL192State *daisy_callback;
-    uint8_t  daisy_input;
+    uint8_t daisy_input;
+    bool daisy_fiq;
 
     /* Parent interrupts */
     qemu_irq irq;
@@ -75,6 +73,6 @@ struct PL192State {
     PL192State *daisy;
 };
 
-DeviceState *pl192_manual_init(char *mem_name, ...);
+
 
 #endif

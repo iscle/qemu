@@ -5453,13 +5453,35 @@ static bool op_s_rxi_rot(DisasContext *s, arg_s_rri_rot *a,
     static bool trans_##NAME##_rxi(DisasContext *s, arg_s_rri_rot *a)   \
     { StoreRegKind k = (K); return op_s_rxi_rot(s, a, OP, L, k); }
 
+/*
+ * A32 compare/test encodings have an SBZ destination field. Nonzero values
+ * are architecturally UNPREDICTABLE. For ARM926, model them as the ordinary
+ * flag-setting operation without a destination write. Its iPod graphics JIT
+ * emits such encodings. Retain UNDEF for other models.
+ * Thumb encodings do not have this reserved field.
+ */
+static bool cmp_rd_valid(DisasContext *s, int rd)
+{
+    return s->thumb || rd == 0 ||
+           arm_dc_feature(s, ARM_FEATURE_IGNORE_CMP_RD);
+}
+
 #define DO_CMP2(NAME, OP, L)                                            \
     static bool trans_##NAME##_xrri(DisasContext *s, arg_s_rrr_shi *a)  \
-    { return op_s_rrr_shi(s, a, OP, L, STREG_NONE); }                   \
+    {                                                               \
+        return cmp_rd_valid(s, a->rd) &&                             \
+               op_s_rrr_shi(s, a, OP, L, STREG_NONE);                 \
+    }                   \
     static bool trans_##NAME##_xrrr(DisasContext *s, arg_s_rrr_shr *a)  \
-    { return op_s_rrr_shr(s, a, OP, L, STREG_NONE); }                   \
+    {                                                               \
+        return cmp_rd_valid(s, a->rd) &&                             \
+               op_s_rrr_shr(s, a, OP, L, STREG_NONE);                 \
+    }                   \
     static bool trans_##NAME##_xri(DisasContext *s, arg_s_rri_rot *a)   \
-    { return op_s_rri_rot(s, a, OP, L, STREG_NONE); }
+    {                                                               \
+        return cmp_rd_valid(s, a->rd) &&                             \
+               op_s_rri_rot(s, a, OP, L, STREG_NONE);                 \
+    }
 
 DO_ANY3(AND, tcg_gen_and_i32, a->s, STREG_NORMAL)
 DO_ANY3(EOR, tcg_gen_xor_i32, a->s, STREG_NORMAL)

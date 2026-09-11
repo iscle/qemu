@@ -1,401 +1,416 @@
+/*
+ * Samsung S5L8702 LCD interface and panel.
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * retailOS 2.0.4 0x081448b0 enables the frame engine at +0x70.
+ * 0x080baef4 selects the display input at +0x80, then 0x080db2e0 sends
+ * the panel column/page window and memory-write command. Panel command 0x35
+ * enables TE: GPIO 55 reaches 0x080cc210 through the external interrupt
+ * dispatcher, then 0x08143f34 submits a frame if the guest marked it dirty.
+ * Host presentation reads panel GRAM, never live guest layers. The timer
+ * models the panel's TE source; it does not transfer frames on its own.
+ */
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/misc/s5l8702-lcd.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
+#include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "hw/misc/s5l8702-lcd.h"
 #include "ui/pixel_ops.h"
-#include "ui/console.h"
-#include "hw/display/framebuffer.h"
 #include "trace.h"
 
-#define LCD_CONFIG (0x000)
-#define LCD_WCMD   (0x004)
-#define LCD_RCMD   (0x00c)
-#define LCD_RDATA  (0x010)
-#define LCD_DBUFF  (0x014)
-#define LCD_INTCON (0x018)
-#define LCD_STATUS (0x01c)
-#define LCD_PHTIME (0x020)
-#define LCD_WDATA  (0x040)
+#define REG(s, off) ((s)->regs[(off) / 4])
+#define LCD_CONFIG       0x00
+#define LCD_WCMD         0x04
+#define LCD_RCMD         0x0c
+#define LCD_RDATA        0x10
+#define LCD_DBUFF        0x14
+#define LCD_INTCON       0x18
+#define LCD_STATUS       0x1c
+#define LCD_PHTIME       0x20
+#define LCD_WDATA        0x40
+#define LCD_FRAME_ENABLE 0x70
+#define LCD_FRAME_SIZE   0x74
+#define LCD_FRAME_TIMING 0x78
+#define LCD_FRAME_CONFIG 0x7c
+#define LCD_FRAME_INPUT  0x80
+#define LCD_FRAME_UNK84  0x84
+#define LCD_FRAME_UNK88  0x88
+#define LCD_FRAME_STATUS 0x8c
 
-#define LCD_STATUS_READY    BIT(1)
-
-static uint64_t s5l8702_lcd_read(void *opaque, hwaddr offset,
-                                 unsigned size) {
-    const S5L8702LcdState *s = S5L8702_LCD(opaque);
-    uint32_t r = 0;
-
-    switch (offset) {
-        case LCD_CONFIG:
-            r = s->lcd_config;
-            break;
-        case LCD_WCMD:
-            r = s->lcd_wcmd;
-            break;
-        case LCD_RCMD:
-            r = s->lcd_rcmd;
-            break;
-        case LCD_RDATA:
-            r = s->lcd_rdata;
-            break;
-        case LCD_DBUFF:
-            r = s->lcd_dbuff;
-            break;
-        case LCD_INTCON:
-            r = s->lcd_intcon;
-            break;
-        case LCD_STATUS:
-            r = (1<<0) | (1<<1); // read operation is always done (bit 0) and the fifo is always empty (bit 1)
-            break;
-        case LCD_PHTIME:
-            r = s->lcd_phtime;
-            break;
-        case LCD_WDATA:
-            r = s->lcd_wdata;
-            break;
-        default:
-            qemu_log_mask(LOG_UNIMP, "%s: unimplemented read (offset 0x%04x)\n",
-                          __func__, (uint32_t) offset);
-            break;
-    }
-
-    return r;
+static bool lcd_window_valid(S5L8702LcdState *s)
+{
+    return s->sc <= s->ec && s->sp <= s->ep &&
+           s->ec < S5L8702_DISP_WIDTH && s->ep < S5L8702_DISP_HEIGHT;
 }
 
-static void s5l8702_lcd_write(void *opaque, hwaddr offset,
-                              uint64_t val, unsigned size) {
-    S5L8702LcdState *s = S5L8702_LCD(opaque);
+static void lcd_transfer_frame(S5L8702LcdState *s)
+{
+    if (!s->disp || !lcd_window_valid(s)) {
+        return;
+    }
+    if (!s5l8702_disp_compose(s->disp, s->composed,
+                             S5L8702_DISP_WIDTH, S5L8702_DISP_HEIGHT)) {
+        return;
+    }
+    for (unsigned y = s->sp; y <= s->ep; y++) {
+        unsigned offset = y * S5L8702_DISP_WIDTH + s->sc;
+        memcpy(&s->framebuffer[offset], &s->composed[offset],
+               (s->ec - s->sc + 1) * sizeof(uint16_t));
+    }
+    s->invalidate = true;
+}
+
+static void lcd_te_schedule(S5L8702LcdState *s)
+{
+    if (s->te_enabled && !s->sleeping) {
+        timer_mod(s->te_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / s->refresh_rate);
+    } else {
+        timer_del(s->te_timer);
+    }
+}
+
+static void lcd_te_timer(void *opaque)
+{
+    S5L8702LcdState *s = opaque;
+
+    if (s->te_enabled && !s->sleeping) {
+        /* Pulse width and exact panel oscillator rate remain unmeasured. */
+        qemu_irq_pulse(s->te);
+        lcd_te_schedule(s);
+    }
+}
+
+static void lcd_command(S5L8702LcdState *s, uint8_t command)
+{
+    s->command = command;
+    s->parameter = 0;
+    trace_s5l8702_lcd_write("WCMD", command);
+    switch (command) {
+    case 0x04: /* Read display ID. The first byte is a dummy cycle. */
+        s->reply[0] = 0;
+        s->reply[1] = 0x38;
+        s->reply[2] = 0xb3;
+        s->reply[3] = 0x71;
+        s->reply_len = 4;
+        s->reply_pos = 0;
+        break;
+    case 0x10:
+        s->sleeping = true;
+        lcd_te_schedule(s);
+        s->invalidate = true;
+        break;
+    case 0x11:
+        s->sleeping = false;
+        lcd_te_schedule(s);
+        s->invalidate = true;
+        break;
+    case 0x28:
+        s->display_on = false;
+        s->invalidate = true;
+        break;
+    case 0x29:
+        s->display_on = true;
+        s->invalidate = true;
+        break;
+    case 0x34:
+        s->te_enabled = false;
+        lcd_te_schedule(s);
+        break;
+    case 0x35:
+        s->te_enabled = true;
+        lcd_te_schedule(s);
+        break;
+    case 0x2c:
+        s->x = s->sc;
+        s->y = s->sp;
+        if ((REG(s, LCD_FRAME_ENABLE) & 1) &&
+            (REG(s, LCD_FRAME_INPUT) & 1)) {
+            lcd_transfer_frame(s);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void lcd_pixel(S5L8702LcdState *s, uint16_t value)
+{
+    if (!lcd_window_valid(s) || s->x < s->sc || s->x > s->ec ||
+        s->y < s->sp || s->y > s->ep) {
+        qemu_log_mask(LOG_GUEST_ERROR, "s5l8702-lcd: invalid pixel window\n");
+        return;
+    }
+    s->framebuffer[s->y * S5L8702_DISP_WIDTH + s->x] = value;
+    if (++s->x > s->ec) {
+        s->x = s->sc;
+        if (++s->y > s->ep) {
+            s->y = s->sp;
+        }
+    }
+    s->invalidate = true;
+}
+
+static void lcd_data(S5L8702LcdState *s, uint32_t value)
+{
+    if (s->command == 0x2c) {
+        lcd_pixel(s, value);
+        return;
+    }
+    trace_s5l8702_lcd_write("WDATA", value);
+    s->panel_regs[s->command] =
+        (s->panel_regs[s->command] << 8) | (value & 0xff);
+    if (s->parameter < 4 && (s->command == 0x2a || s->command == 0x2b)) {
+        uint16_t *p = s->command == 0x2a ?
+                      (s->parameter < 2 ? &s->sc : &s->ec) :
+                      (s->parameter < 2 ? &s->sp : &s->ep);
+        *p = (*p << 8) | (value & 0xff);
+    }
+    if (s->parameter < UINT8_MAX) {
+        s->parameter++;
+    }
+}
+
+static uint64_t s5l8702_lcd_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8702LcdState *s = opaque;
 
     switch (offset) {
-        case LCD_CONFIG:
-            trace_s5l8702_lcd_write("CONFIG", val);
-            s->lcd_config = val;
-            break;
-        case LCD_WCMD:
-            trace_s5l8702_lcd_write("WCMD", val);
-            s->lcd_wcmd = val;
-            switch (s->lcd_wcmd) {
-                case 0x04: // Read display identification information (04h)
-                    trace_s5l8702_lcd_action("read display identification information", val);
-                    fifo8_reset(s->dbuff_buf);
-                    fifo8_push(s->dbuff_buf, 0x00);
-                    fifo8_push(s->dbuff_buf, 0x38);
-                    fifo8_push(s->dbuff_buf, 0xB3);
-                    fifo8_push(s->dbuff_buf, 0x71);
-                    break;
-                case 0x10: // Enter Sleep Mode (10h)
-                    trace_s5l8702_lcd_action("enter sleep mode", val);
-                    break;
-                case 0x11: // Sleep Out (11h)
-                    trace_s5l8702_lcd_action("sleep out", val);
-                    break;
-                case 0x13: // Normal Display Mode ON (13h)
-                    trace_s5l8702_lcd_action("normal display mode on", val);
-                    break;
-                case 0x2a: // Column Address Set (2Ah)
-                    break;
-                case 0x2b: // Page Address Set (2Bh)
-                    break;
-                case 0x2c: // Memory Write (2Ch)
-                    trace_s5l8702_lcd_action("memory write", val);
-                    s->memcnt = 0;
-                    s->address_latches = 0;
-                    break;
-                case 0x28: // Display OFF (28h)
-                    trace_s5l8702_lcd_action("display off", val);
-                    break;
-                case 0x29: // Display ON (29h)
-                    trace_s5l8702_lcd_action("display on", val);
-                    break;
-                case 0x3A: // COLMOD: Pixel Format Set (3Ah)
-                    break;
-                case 0x35: // Tearing Effect Line ON (35h)
-                    break;
-                case 0x36: // Memory Access Control (36h)
-                    break;
-                default:
-                    trace_s5l8702_lcd_action("unimplemented lcd command", val);
-                    break;
-            }
-            break;
-        case LCD_RCMD:
-            trace_s5l8702_lcd_write("RCMD", val);
-            s->lcd_rcmd = val;
-            break;
-        case LCD_RDATA:
-            trace_s5l8702_lcd_write("RDATA", val);
-            s->lcd_rdata = val;
-            if (val == 0) {
-                if (fifo8_is_empty(s->dbuff_buf)) s->lcd_dbuff = 0;
-                else s->lcd_dbuff = fifo8_pop(s->dbuff_buf) << 1;
-            }
-            break;
-        case LCD_DBUFF:
-            trace_s5l8702_lcd_write("DBUFF", val);
-            s->lcd_dbuff = val;
-            break;
-        case LCD_INTCON:
-            trace_s5l8702_lcd_write("INTCON", val);
-            s->lcd_intcon = val;
-            break;
-        case LCD_STATUS:
-            trace_s5l8702_lcd_write("STATUS", val);
-            s->lcd_status = val;
-            break;
-        case LCD_PHTIME:
-            trace_s5l8702_lcd_write("PHTIME", val);
-            s->lcd_phtime = val;
-            break;
-        case LCD_WDATA:
-            if (s->lcd_wcmd != 0x2c) trace_s5l8702_lcd_write("WDATA", val);
-            s->lcd_wdata = val;
-            switch (s->lcd_wcmd) {
-                case 0x2A: // Column Address Set (2Ah)
-                    trace_s5l8702_lcd_action("write to column address set", val);
-                    if (s->address_latches < 2) s->sc = (s->sc << 8) | val;
-                    else s->ec = (s->ec << 8) | val;
-                    s->address_latches++;
-                    if (s->address_latches == 4) {
-                        s->address_latches = 0;
-                        trace_s5l8702_lcd_action("LCD GOT 0x2A", val);
-                    }
-                    break;
-                case 0x2B: // Page Address Set (2Bh)
-                    trace_s5l8702_lcd_action("write to page address set", val);
-                    if (s->address_latches < 2) s->sp = (s->sp << 8) | val;
-                    else s->ep = (s->ep << 8) | val;
-                    s->address_latches++;
-                    if (s->address_latches == 4) {
-                        s->address_latches = 0;
-                        trace_s5l8702_lcd_action("LCD GOT 0x2B", val);
-                    }
-                    break;
-                case 0x2C: // Memory Write (2Ch)
-                    uint32_t address;
-                    // this simulates writing pixels as if we were a ILI9341. we start at the top left corner of the column and page defined by sc and sp
-                    // and write pixels until we reach the bottom right corner of the column and page defined by ec and ep. we keep track of the current
-                    // pixel we're on with s->memcnt and increment it every time we write a pixel. we use this to calculate the address of the pixel we're
-                    // writing to in the framebuffer. if we reach the end of the page (memcnt > ec - sc) we increment the page and reset the column.
+    case LCD_STATUS:
+        /* PIO operations complete synchronously: read done and FIFO empty. */
+        return 3;
+    case LCD_FRAME_STATUS:
+        /* Transfer latency and its busy bits are not yet modeled. */
+        return 0;
+    case LCD_CONFIG:
+    case LCD_WCMD:
+    case LCD_RCMD:
+    case LCD_RDATA:
+    case LCD_DBUFF:
+    case LCD_INTCON:
+    case LCD_PHTIME:
+    case LCD_WDATA:
+    case LCD_FRAME_ENABLE:
+    case LCD_FRAME_SIZE:
+    case LCD_FRAME_TIMING:
+    case LCD_FRAME_CONFIG:
+    case LCD_FRAME_INPUT:
+    case LCD_FRAME_UNK84:
+    case LCD_FRAME_UNK88:
+        return REG(s, offset);
+    default:
+        qemu_log_mask(LOG_UNIMP, "s5l8702-lcd: read at +0x%" HWADDR_PRIx
+                      "\n", offset);
+        return 0;
+    }
+}
 
-                    address = (s->sp * 320) + s->sc + s->memcnt;
-                    if (s->memcnt > s->ec - s->sc) {
-                        s->sp++;
-                        // s->sc = 0;
-                        s->memcnt = 0;
-                        address = (s->sp * 320) + s->sc + s->memcnt;
-                    }
+static void s5l8702_lcd_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    S5L8702LcdState *s = opaque;
 
-                    cpu_physical_memory_write(0xfe00000 + address * 2, &val, 2);
-                    s->invalidate = true;
-                    // printf("FB writing %08x to %08x\n", val, 0xfe00000 + address * 2);
-                    s->memcnt++;
-                    break;
-                case 0x3A: // COLMOD: Pixel Format Set (3Ah)
-                    trace_s5l8702_lcd_action("pixel format set", val);
-                    break;
-                case 0x35: // Tearing Effect Line ON (35h)
-                    trace_s5l8702_lcd_action("tearing effect line on", val);
-                    break;
-                case 0x36: // Memory Access Control (36h)
-                    trace_s5l8702_lcd_action("memory access control", val);
-                    break;
-                default:
-                    trace_s5l8702_lcd_action("unimplemented lcd command", s->lcd_wcmd);
-                    s->lcd_regs[s->lcd_wcmd] = s->lcd_regs[s->lcd_wcmd] << 8 | (val & 0xFF);
-                    // fprintf(stderr, "LCD Register 0x%02x = 0x%016llx\n", s->lcd_wcmd, s->lcd_regs[s->lcd_wcmd]);
-                    break;
-            }
-            break;
-        default:
-            qemu_log_mask(LOG_UNIMP, "%s: unimplemented write (offset 0x%04x, value 0x%08x)\n",
-                          __func__, (uint32_t) offset, (uint32_t) val);
-            break;
+    switch (offset) {
+    case LCD_WCMD:
+        REG(s, offset) = value;
+        lcd_command(s, value);
+        break;
+    case LCD_WDATA:
+        REG(s, offset) = value;
+        lcd_data(s, value);
+        break;
+    case LCD_RDATA:
+        REG(s, offset) = value;
+        if (!value) {
+            REG(s, LCD_DBUFF) = s->reply_pos < s->reply_len ?
+                               s->reply[s->reply_pos++] << 1 : 0;
+        }
+        break;
+    case LCD_STATUS:
+        break;
+    case LCD_CONFIG:
+    case LCD_RCMD:
+    case LCD_DBUFF:
+    case LCD_INTCON:
+    case LCD_PHTIME:
+    case LCD_FRAME_ENABLE:
+    case LCD_FRAME_SIZE:
+    case LCD_FRAME_TIMING:
+    case LCD_FRAME_CONFIG:
+    case LCD_FRAME_INPUT:
+    case LCD_FRAME_UNK84:
+    case LCD_FRAME_UNK88:
+        REG(s, offset) = value;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "s5l8702-lcd: write at +0x%" HWADDR_PRIx
+                      " = 0x%08" PRIx64 "\n", offset, value);
+        break;
     }
 }
 
 static const MemoryRegionOps s5l8702_lcd_ops = {
-        .read = s5l8702_lcd_read,
-        .write = s5l8702_lcd_write,
-        .endianness = DEVICE_NATIVE_ENDIAN,
+    .read = s5l8702_lcd_read,
+    .write = s5l8702_lcd_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 2,
+    .valid.max_access_size = 4,
 };
 
-static void s5l8702_lcd_reset(DeviceState *dev) {
-    S5L8702LcdState *s = S5L8702_LCD(dev);
-
-    trace_s5l8702_lcd_reset();
-
-    /* Reset registers */
-    s->config = 0;
-    s->wcmd = 0;
-    s->status = LCD_STATUS_READY;
-    s->phtime = 0;
-    s->wdata = 0;
-
-    s->dbuff_buf = g_malloc0(sizeof(Fifo8));
-    fifo8_create(s->dbuff_buf, 0x4);
-
-    // initialize the lcd's internal registers (they're all just uint64_t's)
-    s->lcd_regs = g_malloc0(sizeof(uint64_t) * 0xFF);
-
-    // initialize the lcd's internal framebuffer
-    s->framebuffer = g_malloc0(sizeof(uint16_t) * 320 * 240);
-}
-
-static void fb_invalidate_display(void *opaque) {
-    S5L8702LcdState *s = S5L8702_LCD(opaque);
-
+static void lcd_invalidate(void *opaque)
+{
+    S5L8702LcdState *s = opaque;
     s->invalidate = true;
 }
 
-static void draw_line32_32(void *opaque, uint8_t *d, const uint8_t *s, int width, int deststep) {
-    uint8_t r, g, b;
-
-    do {
-        uint16_t v = lduw_le_p((void *) s);
-        //printf("V: %d\n", *s);
-        // convert 5-6-5 to 8-8-8
-        // uint16_t v = ((uint16_t *) s)[0];
-        r = (uint8_t)(((v & 0xF800) >> 11) << 3);
-        g = (uint8_t)(((v & 0x7E0) >> 5) << 2);
-        b = (uint8_t)(((v & 0x1F)) << 3);
-        // if(r > 0 && r < 0xFF) printf("R: %d, G: %d, B: %d\n", r, g, b);
-        ((uint32_t *) d)[0] = rgb_to_pixel32(r, g, b);
-        s += 2;
-        d += 4;
-    } while (--width != 0);
-}
-
-static void fb_update_display(void *opaque) {
+static void lcd_update(void *opaque)
+{
     S5L8702LcdState *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
-//    int first = 0;
-//    int last = 0;
-//    int src_width = 0;
-//    int dest_width = 0;
-//    uint32_t xoff = 0, yoff = 0;
-//
-//    if (s->lock || !s->config.xres) {
-//        return;
-//    }
-//
-//    src_width = bcm2835_fb_get_pitch(&s->config);
-//    if (fb_use_offsets(&s->config)) {
-//        xoff = s->config.xoffset;
-//        yoff = s->config.yoffset;
-//    }
-//
-//    dest_width = s->config.xres;
-//
-//    switch (surface_bits_per_pixel(surface)) {
-//        case 0:
-//            return;
-//        case 8:
-//            break;
-//        case 15:
-//            dest_width *= 2;
-//            break;
-//        case 16:
-//            dest_width *= 2;
-//            break;
-//        case 24:
-//            dest_width *= 3;
-//            break;
-//        case 32:
-//            dest_width *= 4;
-//            break;
-//        default:
-//            hw_error("bcm2835_fb: bad color depth\n");
-//            break;
-//    }
-//
-//    if (s->invalidate) {
-//        hwaddr base = s->config.base + xoff + (hwaddr)yoff * src_width;
-//        framebuffer_update_memory_section(&s->fbsection, s->dma_mr,
-//                                          base,
-//                                          s->config.yres, src_width);
-//    }
-//
-//    framebuffer_update_display(surface, &s->fbsection,
-//                               s->config.xres, s->config.yres,
-//                               src_width, dest_width, 0, s->invalidate,
-//                               draw_line_src16, s, &first, &last);
-//
-//    if (first >= 0) {
-//        dpy_gfx_update(s->con, 0, first, s->config.xres,
-//                       last - first + 1);
-//    }
-//
 
-    drawfn draw_line;
-    int src_width, dest_width;
-    int height, first, last;
-    int width, linesize;
-
-    if (!s->con || !surface_bits_per_pixel(surface))
+    if (!s->invalidate) {
         return;
-
-    dest_width = 4;
-    draw_line = draw_line32_32;
-
-    /* Resolution */
-    first = last = 0;
-    width = 320;
-    height = 240;
-    s->invalidate = 1;
-
-    src_width = 2 * width;
-    linesize = surface_stride(surface);
-
-    if (s->invalidate) {
-        framebuffer_update_memory_section(&s->fbsection, s->sysmem, 0xfe00000, height, src_width);
     }
-
-    framebuffer_update_display(surface, &s->fbsection,
-                               width, height,
-                               src_width,       /* Length of source line, in bytes.  */
-                               linesize,        /* Bytes between adjacent horizontal output pixels.  */
-                               dest_width,      /* Bytes between adjacent vertical output pixels.  */
-                               s->invalidate,
-                               draw_line, NULL,
-                               &first, &last);
-    if (first >= 0) {
-        dpy_gfx_update(s->con, 0, first, width, last - first + 1);
+    for (unsigned y = 0; y < S5L8702_DISP_HEIGHT; y++) {
+        uint32_t *row = (uint32_t *)(surface_data(surface) +
+                                    y * surface_stride(surface));
+        for (unsigned x = 0; x < S5L8702_DISP_WIDTH; x++) {
+            uint16_t p = s->display_on && !s->sleeping ?
+                         s->framebuffer[y * S5L8702_DISP_WIDTH + x] : 0;
+            row[x] = rgb_to_pixel32((p >> 8) & 0xf8, (p >> 3) & 0xfc,
+                                    (p << 3) & 0xf8);
+        }
     }
-
+    dpy_gfx_update(s->con, 0, 0, S5L8702_DISP_WIDTH, S5L8702_DISP_HEIGHT);
     s->invalidate = false;
 }
 
-static const GraphicHwOps vgafb_ops = {
-        .invalidate  = fb_invalidate_display,
-        .gfx_update  = fb_update_display,
+static const GraphicHwOps lcd_ops = {
+    .invalidate = lcd_invalidate,
+    .gfx_update = lcd_update,
 };
 
-static void s5l8702_lcd_init(Object *obj) {
+static void s5l8702_lcd_reset(Object *obj, ResetType type)
+{
     S5L8702LcdState *s = S5L8702_LCD(obj);
 
-    trace_s5l8702_lcd_init();
-
-    /* Memory mapping */
-    memory_region_init_io(&s->iomem, OBJECT(s), &s5l8702_lcd_ops, s, TYPE_S5L8702_LCD, S5L8702_LCD_SIZE);
-    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
-
-    s->con = graphic_console_init(DEVICE(obj), 0, &vgafb_ops, s);
-    qemu_console_resize(s->con, 320, 240);
+    memset(s->regs, 0, sizeof(s->regs));
+    memset(s->panel_regs, 0, sizeof(s->panel_regs));
+    memset(s->framebuffer, 0, sizeof(s->framebuffer));
+    memset(s->reply, 0, sizeof(s->reply));
+    timer_del(s->te_timer);
+    s->te_enabled = false;
+    qemu_irq_lower(s->te);
+    s->sc = s->sp = s->x = s->y = 0;
+    s->ec = S5L8702_DISP_WIDTH - 1;
+    s->ep = S5L8702_DISP_HEIGHT - 1;
+    s->command = s->parameter = s->reply_pos = s->reply_len = 0;
+    s->sleeping = true;
+    s->display_on = false;
+    s->invalidate = true;
 }
 
-static void s5l8702_lcd_class_init(ObjectClass *klass, void *data) {
+static int lcd_post_load(void *opaque, int version_id)
+{
+    S5L8702LcdState *s = opaque;
+
+    if (s->reply_len > sizeof(s->reply) || s->reply_pos > s->reply_len ||
+        s->x >= S5L8702_DISP_WIDTH || s->y >= S5L8702_DISP_HEIGHT) {
+        return -EINVAL;
+    }
+    s->invalidate = true;
+    return 0;
+}
+
+static const VMStateDescription vmstate_s5l8702_lcd = {
+    .name = TYPE_S5L8702_LCD,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = lcd_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(regs, S5L8702LcdState, 0x90 / 4),
+        VMSTATE_UINT64_ARRAY(panel_regs, S5L8702LcdState, 256),
+        VMSTATE_UINT16_ARRAY(framebuffer, S5L8702LcdState, S5L8702_LCD_PIXELS),
+        VMSTATE_UINT16(sc, S5L8702LcdState),
+        VMSTATE_UINT16(ec, S5L8702LcdState),
+        VMSTATE_UINT16(sp, S5L8702LcdState),
+        VMSTATE_UINT16(ep, S5L8702LcdState),
+        VMSTATE_UINT16(x, S5L8702LcdState),
+        VMSTATE_UINT16(y, S5L8702LcdState),
+        VMSTATE_UINT8(command, S5L8702LcdState),
+        VMSTATE_UINT8(parameter, S5L8702LcdState),
+        VMSTATE_UINT8_ARRAY(reply, S5L8702LcdState, 4),
+        VMSTATE_UINT8(reply_pos, S5L8702LcdState),
+        VMSTATE_UINT8(reply_len, S5L8702LcdState),
+        VMSTATE_BOOL(sleeping, S5L8702LcdState),
+        VMSTATE_BOOL(display_on, S5L8702LcdState),
+        VMSTATE_BOOL(te_enabled, S5L8702LcdState),
+        VMSTATE_TIMER_PTR(te_timer, S5L8702LcdState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static void s5l8702_lcd_init(Object *obj)
+{
+    S5L8702LcdState *s = S5L8702_LCD(obj);
+
+    memory_region_init_io(&s->iomem, obj, &s5l8702_lcd_ops, s,
+                          TYPE_S5L8702_LCD, S5L8702_LCD_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    s->te_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, lcd_te_timer, s);
+    qdev_init_gpio_out_named(DEVICE(s), &s->te, "te", 1);
+    s->con = graphic_console_init(DEVICE(obj), 0, &lcd_ops, s);
+    qemu_console_resize(s->con, S5L8702_DISP_WIDTH, S5L8702_DISP_HEIGHT);
+}
+
+static void s5l8702_lcd_finalize(Object *obj)
+{
+    S5L8702LcdState *s = S5L8702_LCD(obj);
+
+    timer_free(s->te_timer);
+}
+
+static void s5l8702_lcd_realize(DeviceState *dev, Error **errp)
+{
+    S5L8702LcdState *s = S5L8702_LCD(dev);
+
+    if (!s->refresh_rate || s->refresh_rate > 240) {
+        error_setg(errp, "s5l8702-lcd: refresh-rate must be between 1 and 240");
+    }
+}
+
+/*
+ * Unmeasured panel oscillator approximation, not an S5L8702 register setting.
+ * Neither transfer timings (+0x78/+0x7c) nor command 0x35 establish 60 Hz.
+ */
+static Property lcd_properties[] = {
+    DEFINE_PROP_UINT32("refresh-rate", S5L8702LcdState, refresh_rate, 60),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void s5l8702_lcd_class_init(ObjectClass *klass, void *data)
+{
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = s5l8702_lcd_reset;
+    dc->desc = "S5L8702 LCD interface and panel";
+    dc->realize = s5l8702_lcd_realize;
+    device_class_set_props(dc, lcd_properties);
+    dc->user_creatable = false;
+    dc->vmsd = &vmstate_s5l8702_lcd;
+    RESETTABLE_CLASS(klass)->phases.enter = s5l8702_lcd_reset;
 }
 
 static const TypeInfo s5l8702_lcd_types[] = {
-        {
-                .name = TYPE_S5L8702_LCD,
-                .parent = TYPE_SYS_BUS_DEVICE,
-                .instance_init = s5l8702_lcd_init,
-                .instance_size = sizeof(S5L8702LcdState),
-                .class_init = s5l8702_lcd_class_init,
-        },
+    {
+        .name = TYPE_S5L8702_LCD,
+        .parent = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(S5L8702LcdState),
+        .instance_init = s5l8702_lcd_init,
+        .instance_finalize = s5l8702_lcd_finalize,
+        .class_init = s5l8702_lcd_class_init,
+    },
 };
-DEFINE_TYPES(s5l8702_lcd_types);
+DEFINE_TYPES(s5l8702_lcd_types)

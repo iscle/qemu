@@ -8,12 +8,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/main-loop.h"
 #include "hw/dma/pl080.h"
-#include "hw/hw.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
@@ -35,6 +36,49 @@
 #define PL080_CCTRL_D   0x02000000
 #define PL080_CCTRL_S   0x01000000
 
+static int pl080_post_load(void *opaque, int version_id);
+static void pl080_run(PL080State *s);
+
+enum {
+    PL080_SINGLE,
+    PL080_BURST,
+    PL080_LAST_SINGLE,
+    PL080_LAST_BURST,
+};
+
+/* Host work limit, not a hardware burst size or a timing parameter. */
+#define PL080_WORK_LIMIT 1024
+
+static const VMStateDescription vmstate_pl080_transfer = {
+    .name = "pl080_transfer",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(fifo, PL080Transfer, PL080_FIFO_BYTES),
+        VMSTATE_UINT8(len, PL080Transfer),
+        VMSTATE_UINT16(src_left, PL080Transfer),
+        VMSTATE_UINT16(dst_left, PL080Transfer),
+        VMSTATE_UINT8(src_kind, PL080Transfer),
+        VMSTATE_UINT8(dst_kind, PL080Transfer),
+        VMSTATE_BOOL(started, PL080Transfer),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int pl080_pre_load(void *opaque)
+{
+    PL080State *s = opaque;
+
+    qemu_bh_cancel(s->bh);
+    memset(s->transfer, 0, sizeof(s->transfer));
+    memset(s->hw_req, 0, sizeof(s->hw_req));
+    s->req_last_single = 0;
+    s->req_last_burst = 0;
+    s->req_ack = 0;
+    s->req_busy = 0;
+    return 0;
+}
+
 static const VMStateDescription vmstate_pl080_channel = {
     .name = "pl080_channel",
     .version_id = 1,
@@ -51,8 +95,10 @@ static const VMStateDescription vmstate_pl080_channel = {
 
 static const VMStateDescription vmstate_pl080 = {
     .name = "pl080",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .pre_load = pl080_pre_load,
+    .post_load = pl080_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(tc_int, PL080State),
         VMSTATE_UINT8(tc_mask, PL080State),
@@ -68,6 +114,13 @@ static const VMStateDescription vmstate_pl080 = {
         VMSTATE_STRUCT_ARRAY(chan, PL080State, PL080_MAX_CHANNELS,
                              1, vmstate_pl080_channel, pl080_channel),
         VMSTATE_INT32(running, PL080State),
+        VMSTATE_UINT32_V(req_last_single, PL080State, 2),
+        VMSTATE_UINT32_V(req_last_burst, PL080State, 2),
+        VMSTATE_UINT16_ARRAY_V(hw_req, PL080State, 4, 2),
+        VMSTATE_UINT16_V(req_ack, PL080State, 2),
+        VMSTATE_UINT16_V(req_busy, PL080State, 2),
+        VMSTATE_STRUCT_ARRAY(transfer, PL080State, PL080_MAX_CHANNELS,
+                             2, vmstate_pl080_transfer, PL080Transfer),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -80,140 +133,282 @@ static const unsigned char pl081_id[] =
 
 static void pl080_update(PL080State *s)
 {
-    bool tclevel = (s->tc_int & s->tc_mask);
-    bool errlevel = (s->err_int & s->err_mask);
+    bool tclevel, errlevel;
+
+    s->tc_mask = 0;
+    s->err_mask = 0;
+    for (unsigned c = 0; c < s->nchannels; c++) {
+        if (s->chan[c].conf & PL080_CCONF_ITC) {
+            s->tc_mask |= 1 << c;
+        }
+        if (s->chan[c].conf & PL080_CCONF_IE) {
+            s->err_mask |= 1 << c;
+        }
+    }
+    tclevel = s->tc_int & s->tc_mask;
+    errlevel = s->err_int & s->err_mask;
 
     qemu_set_irq(s->interr, errlevel);
     qemu_set_irq(s->inttc, tclevel);
     qemu_set_irq(s->irq, errlevel || tclevel);
 }
 
-static void pl080_run(PL080State *s)
+static void pl080_channel_error(PL080State *s, unsigned c)
 {
-    int c;
-    int flow;
-    pl080_channel *ch;
-    int swidth;
-    int dwidth;
-    int xsize;
-    int n;
-    int src_id;
-    int dest_id;
-    int size;
-    uint8_t buff[4];
-    uint32_t req;
+    /* DDI 0196G sections 3.6/3.8: bus errors disable the channel. */
+    s->err_int |= 1 << c;
+    s->chan[c].conf &= ~PL080_CCONF_E;
+}
 
-    s->tc_mask = 0;
-    for (c = 0; c < s->nchannels; c++) {
-        if (s->chan[c].conf & PL080_CCONF_ITC)
-            s->tc_mask |= 1 << c;
-        if (s->chan[c].conf & PL080_CCONF_IE)
-            s->err_mask |= 1 << c;
+static uint32_t *pl080_software_request(PL080State *s, unsigned kind)
+{
+    switch (kind) {
+    case PL080_SINGLE:
+        return &s->req_single;
+    case PL080_BURST:
+        return &s->req_burst;
+    case PL080_LAST_SINGLE:
+        return &s->req_last_single;
+    case PL080_LAST_BURST:
+        return &s->req_last_burst;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static uint16_t pl080_hardware_requests(PL080State *s)
+{
+    return s->hw_req[0] | s->hw_req[1] | s->hw_req[2] | s->hw_req[3];
+}
+
+static bool pl080_request_pending(PL080State *s, unsigned id, unsigned kind)
+{
+    uint16_t bit = 1u << id;
+
+    return !((s->req_ack | s->req_busy) & bit) &&
+           ((s->hw_req[kind] | *pl080_software_request(s, kind)) & bit);
+}
+
+static void pl080_request_complete(PL080State *s, unsigned id, unsigned kind)
+{
+    uint16_t bit = 1u << id;
+
+    *pl080_software_request(s, kind) &= ~bit;
+    s->req_busy &= ~bit;
+    if (pl080_hardware_requests(s) & bit) {
+        /* B.6: hold CLR until every request from this peripheral is low. */
+        s->req_ack |= bit;
+        qemu_set_irq(s->request_clear[id], 1);
+    }
+}
+
+static void pl080_abort(PL080State *s, unsigned c)
+{
+    PL080Transfer *t = &s->transfer[c];
+    uint32_t conf = s->chan[c].conf;
+
+    if (t->src_left) {
+        s->req_busy &= ~(1u << ((conf >> 1) & 15));
+    }
+    if (t->dst_left) {
+        s->req_busy &= ~(1u << ((conf >> 6) & 15));
+    }
+    memset(t, 0, sizeof(*t));
+}
+
+static void pl080_channel_complete(PL080State *s, unsigned c)
+{
+    pl080_channel *ch = &s->chan[c];
+    uint32_t next_lli = ch->lli & ~3u;
+    uint8_t descriptor[16];
+
+    /* The completed transfer's I bit controls TC, before loading the next. */
+    if (ch->ctrl & PL080_CCTRL_I) {
+        s->tc_int |= 1 << c;
+    }
+    if (!next_lli) {
+        ch->conf &= ~PL080_CCONF_E;
+        return;
+    }
+    /* LLI bit 0 selects an AHB master; it is not part of the address. */
+    if (address_space_read(&s->downstream_as, next_lli,
+                           MEMTXATTRS_UNSPECIFIED, descriptor,
+                           sizeof(descriptor)) != MEMTX_OK) {
+        pl080_channel_error(s, c);
+        return;
+    }
+    ch->src = ldl_le_p(descriptor);
+    ch->dest = ldl_le_p(descriptor + 4);
+    ch->lli = ldl_le_p(descriptor + 8);
+    ch->ctrl = ldl_le_p(descriptor + 12);
+}
+
+static unsigned pl080_burst_size(unsigned encoded)
+{
+    return encoded ? 1u << (encoded + 1) : 1;
+}
+
+/* One bus access, through the channel's four-word FIFO. */
+static bool pl080_transfer_step(PL080State *s, unsigned c)
+{
+    pl080_channel *ch = &s->chan[c];
+    PL080Transfer *t = &s->transfer[c];
+    unsigned flow = (ch->conf >> 11) & 7;
+    unsigned swidth = 1u << ((ch->ctrl >> 18) & 7);
+    unsigned dwidth = 1u << ((ch->ctrl >> 21) & 7);
+    unsigned count = ch->ctrl & 0xfff;
+    unsigned src_id = (ch->conf >> 1) & 15;
+    unsigned dst_id = (ch->conf >> 6) & 15;
+    unsigned remaining = count * swidth + t->len;
+    bool src_peripheral = flow == 2 || flow == 3;
+    bool dst_peripheral = flow == 1 || flow == 3;
+
+    if (!(ch->conf & PL080_CCONF_E) || !remaining) {
+        return false;
+    }
+    if (flow >= 4) {
+        qemu_log_mask(LOG_UNIMP,
+                      "pl080: peripheral flow control not implemented\n");
+        return false;
+    }
+    if (swidth > 4 || dwidth > 4 || remaining % dwidth) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pl080: channel %u: invalid width or count\n", c);
+        return false;
     }
 
-    if ((s->conf & PL080_CONF_E) == 0)
-        return;
+    if (dst_peripheral && !t->dst_left &&
+        pl080_request_pending(s, dst_id, PL080_BURST)) {
+        /* B.4.2: destinations use BREQ, including a short final burst. */
+        t->dst_kind = PL080_BURST;
+        t->dst_left = MIN(pl080_burst_size((ch->ctrl >> 15) & 7),
+                          remaining / dwidth);
+        s->req_busy |= 1u << dst_id;
+    }
+    if (t->len >= dwidth) {
+        if (!dst_peripheral || t->dst_left) {
+            if (address_space_write(&s->downstream_as, ch->dest,
+                                    MEMTXATTRS_UNSPECIFIED, t->fifo,
+                                    dwidth) != MEMTX_OK) {
+                goto bus_error;
+            }
+            if (ch->ctrl & PL080_CCTRL_DI) {
+                ch->dest += dwidth;
+            }
+            t->len -= dwidth;
+            memmove(t->fifo, t->fifo + dwidth, t->len);
+            if (dst_peripheral && !--t->dst_left) {
+                pl080_request_complete(s, dst_id, t->dst_kind);
+            }
+            if (!count && !t->len && t->started) {
+                t->started = false;
+                pl080_channel_complete(s, c);
+            }
+            return true;
+        }
+    }
 
-    /* If we are already in the middle of a DMA operation then indicate that
-       there may be new DMA requests and return immediately.  */
-    if (s->running) {
-        s->running++;
+    /* Halt stops new source requests; accepted requests can finish. */
+    if (!count || t->len + swidth > sizeof(t->fifo) ||
+        ((ch->conf & PL080_CCONF_H) && !t->src_left)) {
+        return false;
+    }
+    /* Section 3.8.2: memory-to-peripheral starts with a peripheral request. */
+    if (flow == 1 && (!t->dst_left || t->len >= t->dst_left * dwidth)) {
+        return false;
+    }
+    if (src_peripheral && !t->src_left) {
+        unsigned burst = pl080_burst_size((ch->ctrl >> 12) & 7);
+
+        if (count >= burst && pl080_request_pending(s, src_id, PL080_BURST)) {
+            t->src_kind = PL080_BURST;
+            t->src_left = burst;
+        } else if (pl080_request_pending(s, src_id, PL080_SINGLE)) {
+            t->src_kind = PL080_SINGLE;
+            t->src_left = 1;
+        } else {
+            return false;
+        }
+        s->req_busy |= 1u << src_id;
+    }
+    if (address_space_read(&s->downstream_as, ch->src,
+                           MEMTXATTRS_UNSPECIFIED, t->fifo + t->len,
+                           swidth) != MEMTX_OK) {
+        goto bus_error;
+    }
+    if (ch->ctrl & PL080_CCTRL_SI) {
+        ch->src += swidth;
+    }
+    t->len += swidth;
+    t->started = true;
+    ch->ctrl = (ch->ctrl & ~0xfffu) | (count - 1);
+    if (src_peripheral && !--t->src_left) {
+        pl080_request_complete(s, src_id, t->src_kind);
+    }
+    return true;
+bus_error:
+    pl080_channel_error(s, c);
+    pl080_abort(s, c);
+    return true;
+}
+
+static void pl080_run(PL080State *s)
+{
+    unsigned work = 0;
+
+    if (s->running || !(s->conf & PL080_CONF_E)) {
         return;
     }
     s->running = 1;
-    while (s->running) {
+    while (work < PL080_WORK_LIMIT && (s->conf & PL080_CONF_E)) {
+        unsigned c;
+
         for (c = 0; c < s->nchannels; c++) {
-            ch = &s->chan[c];
-again:
-            /* Test if thiws channel has any pending DMA requests.  */
-            if ((ch->conf & (PL080_CCONF_H | PL080_CCONF_E))
-                    != PL080_CCONF_E)
-                continue;
-            flow = (ch->conf >> 11) & 7;
-            if (flow >= 4) {
-                hw_error(
-                    "pl080_run: Peripheral flow control not implemented\n");
+            if (pl080_transfer_step(s, c)) {
+                break;
             }
-            src_id = (ch->conf >> 1) & 0x1f;
-            dest_id = (ch->conf >> 6) & 0x1f;
-            size = ch->ctrl & 0xfff;
-            req = s->req_single | s->req_burst;
-//            switch (flow) {
-//            case 0:
-//                break;
-//            case 1:
-//                if ((req & (1u << dest_id)) == 0)
-//                    size = 0;
-//                break;
-//            case 2:
-//                if ((req & (1u << src_id)) == 0)
-//                    size = 0;
-//                break;
-//            case 3:
-//                if ((req & (1u << src_id)) == 0
-//                        || (req & (1u << dest_id)) == 0)
-//                    size = 0;
-//                break;
-//            }
-            if (!size)
-                continue;
-
-            /* Transfer one element.  */
-            /* ??? Should transfer multiple elements for a burst request.  */
-            /* ??? Unclear what the proper behavior is when source and
-               destination widths are different.  */
-            swidth = 1 << ((ch->ctrl >> 18) & 7);
-            dwidth = 1 << ((ch->ctrl >> 21) & 7);
-            for (n = 0; n < dwidth; n+= swidth) {
-                address_space_read(&s->downstream_as, ch->src,
-                                   MEMTXATTRS_UNSPECIFIED, buff + n, swidth);
-                if (ch->ctrl & PL080_CCTRL_SI)
-                    ch->src += swidth;
-            }
-            xsize = (dwidth < swidth) ? swidth : dwidth;
-            /* ??? This may pad the value incorrectly for dwidth < 32.  */
-            for (n = 0; n < xsize; n += dwidth) {
-                address_space_write(&s->downstream_as, ch->dest + n,
-                                    MEMTXATTRS_UNSPECIFIED, buff + n, dwidth);
-                if (ch->ctrl & PL080_CCTRL_DI)
-                    ch->dest += swidth;
-            }
-
-            size--;
-            ch->ctrl = (ch->ctrl & 0xfffff000) | size;
-            if (size == 0) {
-                /* Transfer complete.  */
-                if (ch->lli) {
-                    ch->src = address_space_ldl_le(&s->downstream_as,
-                                                   ch->lli,
-                                                   MEMTXATTRS_UNSPECIFIED,
-                                                   NULL);
-                    ch->dest = address_space_ldl_le(&s->downstream_as,
-                                                    ch->lli + 4,
-                                                    MEMTXATTRS_UNSPECIFIED,
-                                                    NULL);
-                    ch->ctrl = address_space_ldl_le(&s->downstream_as,
-                                                    ch->lli + 12,
-                                                    MEMTXATTRS_UNSPECIFIED,
-                                                    NULL);
-                    ch->lli = address_space_ldl_le(&s->downstream_as,
-                                                   ch->lli + 8,
-                                                   MEMTXATTRS_UNSPECIFIED,
-                                                   NULL);
-                } else {
-                    ch->conf &= ~PL080_CCONF_E;
-                }
-                if (ch->ctrl & PL080_CCTRL_I) {
-                    s->tc_int |= 1 << c;
-                }
-            }
-            goto again;
         }
-        if (--s->running)
-            s->running = 1;
+        if (c == s->nchannels) {
+            break;
+        }
+        work++;
+    }
+    s->running = 0;
+    if (work == PL080_WORK_LIMIT) {
+        /* Yield to the main loop even for a cyclic list or recursive DREQ. */
+        qemu_bh_schedule(s->bh);
     }
     pl080_update(s);
 }
+
+static void pl080_bh(void *opaque)
+{
+    pl080_run(opaque);
+}
+
+static void pl080_request_input(PL080State *s, unsigned kind,
+                                 unsigned id, int level)
+{
+    uint16_t bit = 1u << id;
+
+    s->hw_req[kind] = (s->hw_req[kind] & ~bit) | (level ? bit : 0);
+    if ((s->req_ack & bit) && !(pl080_hardware_requests(s) & bit)) {
+        s->req_ack &= ~bit;
+        qemu_set_irq(s->request_clear[id], 0);
+    }
+    pl080_run(s);
+}
+
+#define PL080_REQUEST_INPUT(name, kind) \
+    static void name(void *opaque, int id, int level) \
+    { \
+        pl080_request_input(opaque, kind, id, level); \
+    }
+
+PL080_REQUEST_INPUT(pl080_single, PL080_SINGLE)
+PL080_REQUEST_INPUT(pl080_burst, PL080_BURST)
+PL080_REQUEST_INPUT(pl080_last_single, PL080_LAST_SINGLE)
+PL080_REQUEST_INPUT(pl080_last_burst, PL080_LAST_BURST)
 
 static uint64_t pl080_read(void *opaque, hwaddr offset,
                            unsigned size)
@@ -241,9 +436,14 @@ static uint64_t pl080_read(void *opaque, hwaddr offset,
         case 2: /* LLI */
             return s->chan[i].lli;
         case 3: /* Control */
-            return s->chan[i].ctrl;
+            /* 2.4: readback counts destination progress in source units. */
+            mask = 1u << ((s->chan[i].ctrl >> 18) & 7);
+            return (s->chan[i].ctrl & ~0xfffu) |
+                   (((s->chan[i].ctrl & 0xfff) +
+                     s->transfer[i].len / mask) & 0xfff);
         case 4: /* Configuration */
-            return s->chan[i].conf;
+            return s->chan[i].conf |
+                   (s->transfer[i].len ? PL080_CCONF_A : 0);
         default:
             goto bad_offset;
         }
@@ -267,11 +467,13 @@ static uint64_t pl080_read(void *opaque, hwaddr offset,
         }
         return mask;
     case 8: /* SoftBReq */
+        return s->req_burst;
     case 9: /* SoftSReq */
+        return s->req_single;
     case 10: /* SoftLBReq */
+        return s->req_last_burst;
     case 11: /* SoftLSReq */
-        /* ??? Implement these. */
-        return 0;
+        return s->req_last_single;
     case 12: /* Configuration */
         return s->conf;
     case 13: /* Sync */
@@ -308,8 +510,12 @@ static void pl080_write(void *opaque, hwaddr offset,
             s->chan[i].ctrl = value;
             break;
         case 4: /* Configuration */
-            s->chan[i].conf = value;
+            if (!(value & PL080_CCONF_E)) {
+                pl080_abort(s, i);
+            }
+            s->chan[i].conf = value & ~PL080_CCONF_A;
             pl080_run(s);
+            pl080_update(s);
             break;
         }
         return;
@@ -322,11 +528,20 @@ static void pl080_write(void *opaque, hwaddr offset,
         s->err_int &= ~value;
         break;
     case 8: /* SoftBReq */
+        s->req_burst |= value & 0xffff;
+        pl080_run(s);
+        break;
     case 9: /* SoftSReq */
+        s->req_single |= value & 0xffff;
+        pl080_run(s);
+        break;
     case 10: /* SoftLBReq */
+        s->req_last_burst |= value & 0xffff;
+        pl080_run(s);
+        break;
     case 11: /* SoftLSReq */
-        /* ??? Implement these.  */
-        qemu_log_mask(LOG_UNIMP, "pl080_write: Soft DMA not implemented\n");
+        s->req_last_single |= value & 0xffff;
+        pl080_run(s);
         break;
     case 12: /* Configuration */
         s->conf = value;
@@ -347,15 +562,27 @@ static void pl080_write(void *opaque, hwaddr offset,
     pl080_update(s);
 }
 
+static bool pl080_accepts(void *opaque, hwaddr addr, unsigned size,
+                           bool is_write, MemTxAttrs attrs)
+{
+    PL080State *s = opaque;
+
+    /* Reject DMA that would recursively reprogram the active controller. */
+    return !is_write || !s->running;
+}
+
 static const MemoryRegionOps pl080_ops = {
     .read = pl080_read,
     .write = pl080_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .valid.accepts = pl080_accepts,
 };
 
-static void pl080_reset(DeviceState *dev)
+static void pl080_reset_enter(Object *obj, ResetType type)
 {
-    PL080State *s = PL080(dev);
+    PL080State *s = PL080(obj);
     int i;
 
     s->tc_int = 0;
@@ -366,7 +593,13 @@ static void pl080_reset(DeviceState *dev)
     s->sync = 0;
     s->req_single = 0;
     s->req_burst = 0;
+    s->req_last_single = 0;
+    s->req_last_burst = 0;
+    s->req_ack = 0;
+    s->req_busy = 0;
     s->running = 0;
+    memset(s->transfer, 0, sizeof(s->transfer));
+    qemu_bh_cancel(s->bh);
 
     for (i = 0; i < s->nchannels; i++) {
         s->chan[i].src = 0;
@@ -375,6 +608,40 @@ static void pl080_reset(DeviceState *dev)
         s->chan[i].ctrl = 0;
         s->chan[i].conf = 0;
     }
+}
+
+static void pl080_reset_hold(Object *obj)
+{
+    PL080State *s = PL080(obj);
+
+    pl080_update(s);
+    for (unsigned id = 0; id < PL080_NUM_PERIPHERALS; id++) {
+        qemu_set_irq(s->request_clear[id], 0);
+    }
+}
+
+static int pl080_post_load(void *opaque, int version_id)
+{
+    PL080State *s = opaque;
+
+    for (unsigned c = 0; c < PL080_MAX_CHANNELS; c++) {
+        PL080Transfer *t = &s->transfer[c];
+
+        if (t->len > sizeof(t->fifo) || t->src_left > 256 ||
+            t->dst_left > 256 || t->src_kind > PL080_LAST_BURST ||
+            t->dst_kind > PL080_LAST_BURST) {
+            return -EINVAL;
+        }
+        s->chan[c].conf &= ~PL080_CCONF_A;
+    }
+    s->running = 1;
+    pl080_update(s);
+    for (unsigned id = 0; id < PL080_NUM_PERIPHERALS; id++) {
+        qemu_set_irq(s->request_clear[id], !!(s->req_ack & (1u << id)));
+    }
+    s->running = 0;
+    qemu_bh_schedule(s->bh);
+    return 0;
 }
 
 static void pl080_init(Object *obj)
@@ -387,6 +654,17 @@ static void pl080_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->interr);
     sysbus_init_irq(sbd, &s->inttc);
+    qdev_init_gpio_in_named(DEVICE(obj), pl080_single, "dreq-single",
+                            PL080_NUM_PERIPHERALS);
+    qdev_init_gpio_in_named(DEVICE(obj), pl080_burst, "dreq-burst",
+                            PL080_NUM_PERIPHERALS);
+    qdev_init_gpio_in_named(DEVICE(obj), pl080_last_single, "dreq-last-single",
+                            PL080_NUM_PERIPHERALS);
+    qdev_init_gpio_in_named(DEVICE(obj), pl080_last_burst, "dreq-last-burst",
+                            PL080_NUM_PERIPHERALS);
+    qdev_init_gpio_out_named(DEVICE(obj), s->request_clear, "dreq-clear",
+                             PL080_NUM_PERIPHERALS);
+    s->bh = qemu_bh_new(pl080_bh, s);
     s->nchannels = 8;
 }
 
@@ -409,6 +687,19 @@ static void pl081_init(Object *obj)
     s->nchannels = 2;
 }
 
+static void pl080_unrealize(DeviceState *dev)
+{
+    PL080State *s = PL080(dev);
+
+    qemu_bh_cancel(s->bh);
+    address_space_destroy(&s->downstream_as);
+}
+
+static void pl080_finalize(Object *obj)
+{
+    qemu_bh_delete(PL080(obj)->bh);
+}
+
 static Property pl080_properties[] = {
     DEFINE_PROP_LINK("downstream", PL080State, downstream,
                      TYPE_MEMORY_REGION, MemoryRegion *),
@@ -418,11 +709,14 @@ static Property pl080_properties[] = {
 static void pl080_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
 
     dc->vmsd = &vmstate_pl080;
     dc->realize = pl080_realize;
+    dc->unrealize = pl080_unrealize;
     device_class_set_props(dc, pl080_properties);
-    dc->reset = pl080_reset;
+    rc->phases.enter = pl080_reset_enter;
+    rc->phases.hold = pl080_reset_hold;
 }
 
 static const TypeInfo pl080_info = {
@@ -430,6 +724,7 @@ static const TypeInfo pl080_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(PL080State),
     .instance_init = pl080_init,
+    .instance_finalize = pl080_finalize,
     .class_init    = pl080_class_init,
 };
 

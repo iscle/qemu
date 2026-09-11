@@ -129,3 +129,6 @@ s5l8702_ata_class_init(void)
 s5l8702_ata_init(void)
 s5l8702_ata_reset(void)
 s5l8702_ata_set_drive_info(void* i) "IDE drive info: %p"
+
+# s5l8702-ata.c
+s5l8702_ata_dma(bool write, uint32_t lba, uint32_t sectors, uint32_t buffer) "write=%d lba=%u sectors=%u buffer=0x%08x"

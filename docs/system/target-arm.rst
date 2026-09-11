@@ -88,6 +88,7 @@ undocumented; you can get a complete list by running
    arm/cubieboard
    arm/emcraft-sf2
    arm/highbank
+   arm/ipod-classic
    arm/musicpal
    arm/gumstix
    arm/mainstone

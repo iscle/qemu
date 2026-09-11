@@ -8,7 +8,7 @@ ARM_SRC=$(SRC_PATH)/tests/tcg/arm
 # Set search path for all sources
 VPATH 		+= $(ARM_SRC)
 
-ARM_TESTS=test-armv6m-undef
+ARM_TESTS=test-armv6m-undef test-cmp-sbz
 
 TESTS += $(ARM_TESTS)
 
@@ -24,3 +24,13 @@ test-armv6m-undef: EXTRA_CFLAGS+=-mcpu=cortex-m0 -mfloat-abi=soft
 
 run-test-armv6m-undef: QEMU_OPTS+=-semihosting -M microbit -kernel
 run-plugin-test-armv6m-undef-%: QEMU_OPTS+=-semihosting -M microbit -kernel
+
+test-cmp-sbz: EXTRA_CFLAGS+=-mcpu=arm926ej-s -marm -mfloat-abi=soft
+
+run-test-cmp-sbz: QEMU_OPTS+=-semihosting -M versatilepb -cpu arm926 -kernel
+run-plugin-test-cmp-sbz-%: QEMU_OPTS+=-semihosting -M versatilepb -cpu arm926 -kernel
+
+EXTRA_RUNS += run-test-cmp-sbz-arm1176
+run-test-cmp-sbz-arm1176: test-cmp-sbz
+	$(call run-test,test-cmp-sbz-arm1176,$(QEMU) -display none -semihosting \
+		-M versatilepb -cpu arm1176 -kernel $<)

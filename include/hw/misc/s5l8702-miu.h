@@ -18,6 +18,7 @@ struct S5L8702MiuState {
 
     /*< public >*/
     MemoryRegion iomem;
+    qemu_irq remap;
     uint32_t regs[S5L8702_MIU_NUM_REGS];
 };
 

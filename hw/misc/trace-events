@@ -309,6 +309,8 @@ s5l8702_sysic_init(void) "init"
 # s5l8702-clk.c
 s5l8702_clk_reset(void) "reset"
 s5l8702_clk_init(void) "init"
+s5l8702_clk_access(bool write, uint64_t offset, uint32_t value) "write=%d offset=0x%" PRIx64 " value=0x%08x"
+s5l8702_clk_rates(uint64_t cclk, uint64_t hclk, uint64_t pclk, uint64_t eclk, bool timer_enabled) "cclk=%" PRIu64 " hclk=%" PRIu64 " pclk=%" PRIu64 " eclk=%" PRIu64 " timer=%d"
 
 # s5l8702-jpeg.c
 s5l8702_jpeg_reset(void) "reset"
@@ -325,6 +327,7 @@ s5l8702_miu_read(uint32_t offset, uint32_t val) "offset 0x%08x -> 0x%08x"
 s5l8702_miu_write(uint32_t offset, uint32_t val) "offset 0x%08x <- 0x%08x"
 
 # pcf5063x.c
+pcf5063x_rtc_alarm(void) "RTC alarm"
 pcf5063x_read(uint8_t addr, uint8_t value) "read addr 0x%02x: 0x%02x"
 pcf5063x_write(uint8_t addr, uint8_t value) "write addr 0x%02x: 0x%02x"
 pcf5063x_unknown_read(uint8_t addr) "unknown read addr 0x%02x"
@@ -398,3 +401,12 @@ s5l8702_usbphy_init(void) "init"
 s5l8702_usbphy_reset(void) "reset"
 s5l8702_usbphy_read(uint32_t offset, uint32_t val) "offset 0x%08x -> 0x%08x"
 s5l8702_usbphy_write(uint32_t offset, uint32_t val) "offset 0x%08x <- 0x%08x"
+
+s5l8702_clickwheel_access(bool write, uint64_t offset, uint32_t value) "write=%d offset=0x%" PRIx64 " value=0x%08x"
+
+s5l8702_disp_access(bool write, uint64_t offset, uint32_t value) "write=%d offset=0x%03" PRIx64 " value=0x%08x"
+
+# s5l8702-i2s.c
+s5l8702_i2s_frame(uint32_t frame, uint64_t samples) "frame=0x%08x samples=%" PRIu64
+s5l8702_cs42l55_frame(uint32_t frame, uint64_t frames) "frame=0x%08x frames=%" PRIu64
+s5l8702_cs42l55_latch(unsigned output, uint8_t control, uint64_t frames, const char *reason) "output=%u control=0x%02x frames=%" PRIu64 " reason=%s"

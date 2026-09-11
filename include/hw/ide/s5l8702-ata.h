@@ -27,6 +27,19 @@ struct S5L8702AtaState {
     uint32_t remaining_rdata;
     uint8_t drq;
 
+    /* Data transfer state (PIO buffer / DMA) */
+    BlockBackend *blk;
+    uint8_t *xfer_buf;      /* PIO data buffer (identify or sector data) */
+    uint32_t xfer_cap;      /* allocated capacity of xfer_buf */
+    uint32_t xfer_len;      /* valid bytes in xfer_buf */
+    uint32_t xfer_pos;      /* current byte position for PIO */
+    uint8_t xfer_is_write;  /* 1 if PIO write in progress */
+    uint32_t cur_cmd;       /* last command written to CSD */
+    uint32_t cur_lba;       /* LBA captured at command time */
+    uint32_t cur_count;     /* sector count captured at command time */
+    uint8_t dma_pending;    /* a DMA data command awaits COMMAND=start */
+    uint8_t dma_is_write;   /* pending DMA is a write */
+
     uint32_t ata_control;
     uint32_t ata_status;
     uint32_t ata_command;

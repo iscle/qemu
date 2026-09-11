@@ -3,7 +3,6 @@
 
 #include "qom/object.h"
 #include "hw/sysbus.h"
-#include "crypto/aes.h"
 
 #define TYPE_S5L8702_AES    "s5l8702-aes"
 OBJECT_DECLARE_SIMPLE_TYPE(S5L8702AesState, S5L8702_AES)
@@ -33,39 +32,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8702AesState, S5L8702_AES)
 #define AES_KEYSIZE 0x20
 #define AES_IVSIZE 0x10
 
-typedef enum AESKeyType {
-    AESCustom = 0,
-    AESGID = 1,
-    AESUID = 2
-} AESKeyType;
-
-typedef enum AESKeyLen {
-    AES128 = 0,
-    AES192 = 1,
-    AES256 = 2
-} AESKeyLen;
-
-typedef struct S5L8702AesState
-{
-    /*< private >*/
+struct S5L8702AesState {
     SysBusDevice parent_obj;
-
-    /*< public >*/
     MemoryRegion iomem;
-    AES_KEY decryptKey;
-	uint32_t ivec[4];
-	uint32_t insize;
-	uint32_t inaddr;
-	uint32_t outsize;
-	uint32_t outaddr;
-	uint32_t auxaddr;
-	uint32_t keytype;
-	uint32_t status;
-	uint32_t ctrl;
-	uint32_t unkreg0;
-	uint32_t unkreg1;
-	uint32_t keylen;
-	uint32_t custkey[8]; 
-} S5L8702AesState;
+    uint32_t regs[33];
+    bool fused_key_bypass;
+};
 
 #endif /* HW_MISC_S5L8702_AES_H */

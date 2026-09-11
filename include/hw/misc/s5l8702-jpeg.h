@@ -94,6 +94,7 @@ struct S5L8702JpegState {
     uint8_t *cached_cb;
     uint8_t *cached_cr;
     uint32_t ctrl_trigger_count;
+    uint32_t status_toggle;     /* toggles the 0x41808 busy bit between reads */
 };
 
 #endif /* HW_MISC_S5L8702_JPEG_H */

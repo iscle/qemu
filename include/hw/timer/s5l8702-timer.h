@@ -43,6 +43,7 @@ typedef struct S5L8702Timer {
     bool     running;       /* timer is currently counting */
     uint64_t start_ns;      /* QEMU virtual clock (ns) when timer started/reset */
     uint32_t start_count;   /* counter value at start_ns */
+    uint32_t fraction;      /* fractional counter tick, in billionths */
     uint32_t sched_count;   /* counter value scheduled for next QEMUTimer expiry */
     uint32_t sched_events;  /* bitmask of events due at sched_count */
 } S5L8702Timer;

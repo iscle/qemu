@@ -12,6 +12,7 @@
 #include "qemu/module.h"
 #include "hw/sysbus.h"
 #include "exec/cpu-common.h"
+#include "hw/core/cpu.h"
 #include "hw/misc/s5l8702-jpeg.h"
 
 #include <math.h>
@@ -322,10 +323,41 @@ static void s5l8702_jpeg_handle_ctrl(S5L8702JpegState *s, uint32_t val)
 
 static uint64_t s5l8702_jpeg_read(void *opaque, hwaddr offset, unsigned size)
 {
+    S5L8702JpegState *s = S5L8702_JPEG(opaque);
+
+    if (getenv("JPEG_TRACE") && offset == 0x41808 && current_cpu) {
+        static uint32_t last;
+        uint32_t pc = (uint32_t)CPU_GET_CLASS(current_cpu)->get_pc(current_cpu);
+        if (pc != last) {
+            fprintf(stderr, "JPEG41808 read pc=0x%08x\n", pc);
+            last = pc;
+        }
+    }
     switch (offset) {
     case S5L8702_JPEG_REG_UNK_STATUS:
         /* The firmware polls this; returning -1 satisfies its check. */
         return 0xFFFFFFFF;
+    case 0x41808:
+        /*
+         * retailOS 35.2.0.4 decode-status; bit 1 (0x2) is the engine "busy"
+         * flag. The guest writes a start command then polls this until busy
+         * clears. We do not decode for this register layout, so complete
+         * instantly: report busy on the first read after a start (so the guest
+         * sees the op accepted) and idle afterwards (so its wait loop
+         * advances).
+         * Other bits stay set for the status-present check the guest makes.
+         */
+        if (s->status_toggle) {
+            s->status_toggle = 0;
+            return 0xFFFFFFFF;       /* busy, just this once */
+        }
+        return 0xFFFFFFFD;           /* idle / done */
+    case 0x50014:
+        /*
+         * Engine status polled at 0x0bf0eeec: bit 16 = "busy". Report not-busy
+         * (0) so the JPEG-engine drive loop advances instead of spinning.
+         */
+        return 0x00000000;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "%s: unimplemented read (offset 0x%05x)\n",
@@ -352,6 +384,13 @@ static void s5l8702_jpeg_write(void *opaque, hwaddr offset, uint64_t val,
     }
 
     switch (offset) {
+    case 0x41800:
+        /*
+         * Decode start/command (retailOS 35.2.0.4). Mark the engine busy for
+         * the next status read at 0x41808; we complete instantly.
+         */
+        s->status_toggle = 1;
+        break;
     case S5L8702_JPEG_REG_COEFF_BASE:
         s->coeff_base = val;
         break;

@@ -1,3 +1,6 @@
+# s5l8702-spi.c
+s5l8702_spi_control(void *s, uint32_t offset, uint32_t value) "%p write +0x%02x = 0x%08x"
+
 # aspeed_smc.c
 
 aspeed_smc_flash_set_segment(int cs, uint64_t reg, uint64_t start, uint64_t end) "CS%d segreg=0x%"PRIx64" [ 0x%"PRIx64" - 0x%"PRIx64" ]"
