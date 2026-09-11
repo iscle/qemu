@@ -498,3 +498,41 @@ Successful tests created ``Device/clock`` and ``Tones/Beep.tone`` through
 emulated ATA writes. A restore/iTunes graphic or an Apple logo alone is
 not a passing boot result. Other firmware versions and unused peripheral
 modes require their own reverse-engineering and validation.
+
+Original JPEG driver diagnostic
+-------------------------------
+
+The optional probe generates four baseline JPEG inputs and invokes the
+original retailOS memory-input decoder. It requires Pillow, GDB with ARM
+and Python support, the verified 2.0.4 OS image and a disposable VM that has
+reached the restored UI. It allocates guest memory and changes device state;
+it does not modify firmware files. Generate its local artifacts outside the
+source tree::
+
+  python3 scripts/ipod-classic/prepare-jpeg-probe.py \
+    --firmware /path/to/osos.fw.decrypted --output ../ipod-jpeg-probe
+
+Attach GDB to the VM's configured debug port. Stop a normal firmware task
+at allocator entry, before the allocator takes its lock::
+
+  hbreak *0x080e07a4
+  continue
+
+UI activity, such as opening Music, reaches this breakpoint. Disable that
+breakpoint before sourcing the generated script; otherwise the probe's own
+allocator call will stop there too::
+
+  disable <breakpoint-number>
+  source /absolute/path/to/ipod-jpeg-probe/probe.gdb
+
+The script checks the execution context and firmware instruction bytes,
+then writes decoded planes and ``results.json``. Four zero return values
+with intact output guards are expected. The target remains stopped at its
+original allocator call afterward; ``continue`` resumes it. Idle-loop and
+sleep contexts are rejected because injected blocking calls there can corrupt
+the firmware scheduler. Discard a diagnostic VM after an interrupted call.
+
+This tests the original driver and emulated block processor. It does not
+prove photo import, video decoding, physical IDCT rounding or every JPEG
+coding mode. The audit records the independent output comparisons and
+the separate Photos thumbnail tests.

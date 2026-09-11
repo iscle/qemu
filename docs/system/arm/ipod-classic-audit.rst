@@ -783,6 +783,36 @@ decompilations/disassembly, ``boot-comparison.json``, block traces and UI
 captures. This preserves the demonstrated boot output; it is not a
 comparison with a physical decoder or an end-to-end retailOS photo test.
 
+**Original retailOS baseline JPEG path now exercised.** A separate
+diagnostic calls the original memory-input decoder ``0x0807bff8`` from a
+normal firmware task. Four generated inputs cover 64x64 and 96x64 4:2:0,
+64x64 4:2:2 and 64x64 4:4:4. All return zero, retain guards around the
+destination planes and complete 560 hardware block requests in total.
+The CPU parses the JPEG and entropy data; the emulated block processor
+performs dequantization/IDCT. Comparisons with libjpeg's integer raw-component
+decoder differ by at most one level per sample. For 4:2:2 and 4:4:4,
+the comparison follows original ``0x080a4f1c``: it selects alternate chroma
+rows, and odd chroma columns for 4:4:4, to produce 4:2:0 output. This checks
+orientation, bank reuse and interrupt-driven completion through the original
+driver; it does not establish the physical decoder's exact rounding.
+
+``scripts/ipod-classic/prepare-jpeg-probe.py`` generates these inputs and a
+GDB script, checks the supplied firmware hash and executing routine bytes,
+and requires a normal task stopped at allocator entry with IRQs enabled.
+Calls injected into the idle loop caused scheduler ready-list corruption
+on repetition; those aborted runs are excluded. The successful task-context
+run returns to the same interrupted call and resumes the normal UI.
+Local evidence is in ``ipod-work/jpeg-retail/reproducible-thread/`` and
+``reproducible-thread-gdb.log``. The diagnostic changes guest RAM using the
+original allocator/decoder/deallocator; firmware files and the OS marker
+remain unchanged.
+
+A separate direct 24x16 call returned zero but overwrote some output rows.
+The original unity-scale fast path in ``0x080a4f1c`` copies whole 8-pixel
+blocks without clipping the final MCU to that width. The required padding
+or higher-level caller contract is not established; this is not counted as
+a correct partial-MCU decode. The repeatable probe uses complete MCUs.
+
 Regression tests reproduce the old unsolicited output when a bank is
 merely armed. They cover incremental input changes, bank ordering, both
 quantization tables, DC clipping, horizontal/vertical AC orientation,
@@ -802,8 +832,9 @@ sub-engine reset commands and stop/restart retention need further work.
 The three-bank queue, destination latching when armed, duplicate-bank
 rejection and behavior for reordered requests are model choices needing
 confirmation beyond the checked driver sequences. Floating-point IDCT
-rounding has not been compared with physical hardware. General JPEG files,
-photos, artwork and video remain unverified.
+rounding has not been compared with physical hardware. Progressive and
+other uncovered JPEG coding modes, partial-MCU output contracts, artwork
+and video remain unverified. The Photos thumbnail path is described below.
 
 9. Playback and media databases
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -823,6 +854,20 @@ This validates that fixture's database, WAV data path, buffer refill and
 serialization. Audible output remains absent. Compressed formats, end of
 track, seeking, pause/resume and gapless playback remain unverified. The JPEG boot-logo path is not a general video
 implementation. Other media still need fixtures and playback tests.
+
+**Generated Photos library verified.** A private copy of the signed media
+fixture contains a libgpod photo database and three generated landscape,
+portrait and 320x240 images. The original UI lists the album, displays its
+three-image grid and opens each image full screen. All 76,800 pixels in each
+capture match the corresponding ``F1024_1.ithmb`` RGB565 image under the
+model's current zero-extension to RGB888, including portrait padding.
+This is a comparison with stored thumbnail data, not a physical-panel color
+measurement. The path uses preconverted thumbnails and generates no JPEG
+block requests beyond the 1,800-request boot logo. It therefore validates
+Photos/database/display behavior separately from JPEG decoding. Evidence
+is in ``ipod-work/jpeg-retail/photo-comparison.json`` and the Photos captures.
+Slideshow timing/transitions, large libraries, full-resolution originals,
+TV output and album artwork remain unverified.
 
 Storage and boot workarounds
 ----------------------------
