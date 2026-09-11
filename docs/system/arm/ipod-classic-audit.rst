@@ -503,11 +503,43 @@ of these SM1 memory regions. The descriptors currently retain the generic
 register-file placeholder, initially zero; this is not a completed memory
 map. Power/run/stop responses remain synthesized, and the processing engine,
 interrupts and timing are unimplemented. The older comments also claimed
-that retailOS never accesses beyond the low 4 KiB; original ``0x080ab4b8``
-does access ``+0x1004/+0x1008``, still in the unimplemented zero window.
+that retailOS never accesses beyond the low 4 KiB. Original ``0x080ab4b8``
+accesses ``+0x1004/+0x1008/+0x100c``; the latter two remain unimplemented.
 Several inherited addresses referred to a different firmware layout and
 have been removed from the implementation comments. A successful codec
 output test does not establish these SM1 functions.
+
+**Upper-page readback corrected.** Original IRAM ``0x2200200c``, clock
+group 8, writes divider minus one to ``0x38501000``. The frequency reader
+``0x08360030`` uses its low nibble plus one with the HCLK source/divider
+entry. The zero window discarded this programming: writing 3 subsequently
+read as divide-by-one instead of divide-by-four. Original ``0x080ab4b8``
+also independently sets/clears bits 0 and 1 at ``+0x1004`` using
+read-modify-write operations; returning zero loses the other enabled bit.
+These two programmed words now retain their values and survive snapshot
+restoration. SM1 VMState version 2 includes them; version 1 restores the
+old zero-window contents. The regression reproduces the divider failure
+on the previous binary and checks bit preservation, reset and snapshots.
+
+This is register readback, not a completed clock or execution model. The
+divider does not yet pace SM1 execution, and the control bits' effects on
+the engine remain unknown. Zero reset contents and storage of unused bits
+are provisional. The write-only usage of ``+0x1008/+0x100c`` in the original
+driver does not establish their readback or full command semantics, so
+those registers still need implementation.
+
+Further original-code tracing identifies the context table at
+``0x08b2f648``, its configured CPU memory base ``0x22020000``, and the
+program-image loader at ``0x080b4768``. Its address mapper ``0x0809a548``
+and copy dispatch ``0x0802e6bc`` handle separate program/data layouts,
+including packed halfwords and banked word uploads. The subsequent poll
+at ``0x0809acec`` waits for ``+0xa98`` bit 2 after an upload; this sequence
+does not establish the inherited label "clock ready". The helper writing
+``+0x824`` also runs from ``0x080a3010`` when ``+0x860`` bit 2 is set.
+That status register and the associated command semantics need decoding.
+Using either write as a generic power-on event remains a workaround.
+The processing instruction set and its actual memory geometry have not
+been identified. Evidence is in ``ipod-work/sm1-geometry/``.
 
 ``ipod-work/wind3x-tail/sm1-evidence.txt`` records the original routines,
 fault traces, removed assumptions and the failing/passing regression.
@@ -1336,7 +1368,7 @@ Local audit evidence and next steps
 
 The audit VM used the normal launcher with ``-snapshot`` so game attempts
 and navigation did not write back to the restored disk/NOR. Ghidra was run
-one process at a time. Peripheral builds use ``ninja -j2``; all sixty-two
+one process at a time. Peripheral builds use ``ninja -j2``; all sixty-three
 current qtests pass.
 
 The paths below identify local investigation artifacts in the surrounding

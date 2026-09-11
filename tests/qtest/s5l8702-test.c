@@ -1769,6 +1769,44 @@ static void test_sm1_memory_descriptors(void)
     qtest_quit(q);
 }
 
+static void test_sm1_upper_controls(void)
+{
+    QTestState *q = start();
+    g_autofree char *result = NULL;
+    const uint32_t saved[] = { 3, 2 };
+
+    /*
+     * retailOS 0x2200200c writes divider - 1 at +0x1000. Its frequency
+     * reader, 0x08360030, uses the low nibble + 1. Returning zero here
+     * loses the programmed divider even before any SM1 processing runs.
+     */
+    qtest_writel(q, SM1 + 0x1000, 3);
+    g_assert_cmpuint((qtest_readl(q, SM1 + 0x1000) & 15) + 1, ==, 4);
+
+    /* Replay 0x080ab4b8's independent bit updates. */
+    qtest_writel(q, SM1 + 0x1004, 0);
+    qtest_writel(q, SM1 + 0x1004, qtest_readl(q, SM1 + 0x1004) | 1);
+    qtest_writel(q, SM1 + 0x1004, qtest_readl(q, SM1 + 0x1004) | 2);
+    g_assert_cmphex(qtest_readl(q, SM1 + 0x1004) & 3, ==, 3);
+    qtest_writel(q, SM1 + 0x1004, qtest_readl(q, SM1 + 0x1004) & 2);
+    g_assert_cmphex(qtest_readl(q, SM1 + 0x1004) & 3, ==, 2);
+
+    result = qtest_hmp(q, "savevm sm1-upper");
+    g_assert_cmpstr(result, ==, "");
+    g_clear_pointer(&result, g_free);
+    qtest_qmp_assert_success(q, "{'execute': 'system_reset'}");
+    for (unsigned i = 0; i < ARRAY_SIZE(saved); i++) {
+        /* The model uses zero reset defaults; silicon defaults are unknown. */
+        g_assert_cmphex(qtest_readl(q, SM1 + 0x1000 + i * 4), ==, 0);
+    }
+    result = qtest_hmp(q, "loadvm sm1-upper");
+    g_assert_cmpstr(result, ==, "");
+    for (unsigned i = 0; i < ARRAY_SIZE(saved); i++) {
+        g_assert_cmphex(qtest_readl(q, SM1 + 0x1000 + i * 4), ==, saved[i]);
+    }
+    qtest_quit(q);
+}
+
 static void test_i2s_clock_gate(void)
 {
     QTestState *q = start();
@@ -2718,6 +2756,7 @@ int main(int argc, char **argv)
     qtest_add_func("/s5l8702/i2s-dma-clock", test_i2s_dma_clock);
     qtest_add_func("/s5l8702/sm1-memory-descriptors",
                    test_sm1_memory_descriptors);
+    qtest_add_func("/s5l8702/sm1-upper-controls", test_sm1_upper_controls);
     qtest_add_func("/s5l8702/i2s-clock-gate", test_i2s_clock_gate);
     qtest_add_func("/s5l8702/i2s-tx-state", test_i2s_tx_state);
     qtest_add_func("/s5l8702/aes", test_aes);

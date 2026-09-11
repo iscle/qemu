@@ -427,7 +427,7 @@ They exercise I2C byte sequencing, MIU remap, timer reload/acknowledgement,
 clickwheel FIFO semantics, DMA bounds, GPIO register width, PL192 priority
 and cascade handling, AES CBC known vectors for all three key sizes, and
 SHA compression/IRQ behavior including more than 1 MiB of streamed blocks.
-The sixty-two tests also cover planar/alpha composition, panel GRAM and
+The sixty-three tests also cover planar/alpha composition, panel GRAM and
 window bounds, GPIO interrupt polarity/masking/acknowledgement, the panel
 TE route, multi-block SHA DMA, and hash context save/restore. PMU cases
 cover hold changes, deferred RTC writes, calendar rollover, retained RTC/GPM
@@ -460,6 +460,9 @@ descriptor interrupt ordering, LLI bus selection, bus-error handling,
 reserved widths, unsupported flow modes, reset and snapshot IRQ state.
 The SM1 regression checks that I2S serialization cannot change its memory
 descriptors; their placeholder values are not asserted as hardware defaults.
+The upper-control case reproduces the original firmware's divider readback
+and independent bit updates at ``+0x1000/+0x1004``, plus reset and snapshots.
+These registers still do not control a working SM1 processing engine.
 Request cases check held/absent requests, software requests, short final
 bursts, packing across requests, count readback, halt/drain, FIFO snapshots,
 circular-list responsiveness and recursive register writes.

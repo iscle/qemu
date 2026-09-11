@@ -20,12 +20,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8702SM1State, S5L8702_SM1)
 
 #define S5L8702_SM1_BASE        0x38500000
 /*
- * Only the low 4 KiB has a register file. The rest is an unimplemented zero
- * window. Original 0x080ab4b8 also accesses +0x1004/+0x1008; these are missing.
+ * The low 4 KiB retains the partial register file. The upper page models
+ * readback of the divider and control at +0x1000/+0x1004. Other upper-page
+ * accesses, including original writes to +0x1008/+0x100c, remain unimplemented.
  */
 #define S5L8702_SM1_MEM_SIZE    0x100000
 #define S5L8702_SM1_REG_BYTES   0x1000
 #define S5L8702_SM1_REG_WORDS   (S5L8702_SM1_REG_BYTES / 4)
+
+/* retailOS 0x2200200c / 0x08360030 and 0x080ab4b8. */
+#define S5L8702_SM1_UPPER_BASE   0x1000
+#define S5L8702_SM1_UPPER_WORDS  2
 
 /* Expected identity constant occurs at original retailOS 0x0809b3c4. */
 #define S5L8702_SM1_ID          0xc80
@@ -35,13 +40,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(S5L8702SM1State, S5L8702_SM1)
 #define S5L8702_SM1_STAT        0xa98
 #define S5L8702_SM1_STAT_READY  (1u << 2)
 
-/* Run/start control and state readback. */
+/* +0x400 control/readback; 0x080c8ac8 writes 0/1 and polls for 1. */
 #define S5L8702_SM1_RUN         0x400
 #define S5L8702_SM1_RUN_MASK    0x3
 
 /* Original 0x080c1754 writes +0x824; 0x080c17bc writes +0xc48. */
-#define S5L8702_SM1_CODEC_EN    0x824
-#define S5L8702_SM1_COMMIT      0xc48
+#define S5L8702_SM1_CONTROL_824  0x824
+#define S5L8702_SM1_CONTROL_C48  0xc48
 
 /*
  * Inherited per-channel sub-blocks: idx 0..3 -> idx*0x20, idx4 -> 0x100,
@@ -64,11 +69,11 @@ struct S5L8702SM1State {
     qemu_irq irq;
 
     uint32_t reg[S5L8702_SM1_REG_WORDS];
+    uint32_t upper_control[S5L8702_SM1_UPPER_WORDS];
 
     /*
-     * Derived engine state: set once the bring-up has powered the block. The
-     * status bit at +0xa98 bit2 and the run-state at +0x400 are answered from
-     * it, so the poll loops end when the firmware's own writes say it is up.
+     * Inherited synthetic response for +0xa98 bit 2. Its actual event source
+     * and relationship to execution/power state remain unimplemented.
      */
     bool powered;
 };

@@ -44,12 +44,22 @@ static bool sm1_is_sub_cmd(hwaddr offset)
     return false;
 }
 
+static bool sm1_is_upper_control(hwaddr offset)
+{
+    return offset >= S5L8702_SM1_UPPER_BASE &&
+           offset < S5L8702_SM1_UPPER_BASE + S5L8702_SM1_UPPER_WORDS * 4;
+}
+
 static uint64_t s5l8702_sm1_read(void *opaque, hwaddr offset, unsigned size)
 {
     S5L8702SM1State *s = S5L8702_SM1(opaque);
     uint32_t val;
 
-    /* Above the modelled low page: a plain zero window. */
+    if (sm1_is_upper_control(offset)) {
+        return s->upper_control[(offset - S5L8702_SM1_UPPER_BASE) / 4];
+    }
+
+    /* Undecoded upper-page accesses retain the zero-window approximation. */
     if (offset >= S5L8702_SM1_REG_BYTES) {
         return 0;
     }
@@ -62,7 +72,8 @@ static uint64_t s5l8702_sm1_read(void *opaque, hwaddr offset, unsigned size)
 
     case S5L8702_SM1_STAT:
         /*
-         * Clock/engine status; bit 2 is "clock ready", answered from powered.
+         * Original 0x0809acec polls bit 2 after a program upload. Its actual
+         * event source is unimplemented; the powered response is provisional.
          */
         val = s->powered ? S5L8702_SM1_STAT_READY : 0;
         break;
@@ -79,8 +90,8 @@ static uint64_t s5l8702_sm1_read(void *opaque, hwaddr offset, unsigned size)
             /*
              * Sub-block state (sub+0x14): a state machine. 7 while the last
              * command was power-up (4) or run (16); 0 once stopped (96) or
-             * never
-             * commanded. These instantaneous transitions remain approximate.
+             * never commanded. These instantaneous transitions remain
+             * approximate.
              */
             uint32_t cmd = s->reg[(offset - 4) / 4];
             switch (cmd) {
@@ -112,19 +123,30 @@ static void s5l8702_sm1_write(void *opaque, hwaddr offset, uint64_t value,
 {
     S5L8702SM1State *s = S5L8702_SM1(opaque);
 
+    if (sm1_is_upper_control(offset)) {
+        /*
+         * 0x2200200c writes divider - 1; 0x08360030 reads its low nibble.
+         * 0x080ab4b8 independently updates bits 0/1 at +0x1004. Preserve
+         * the programmed words; their effect on the unimplemented engine,
+         * reserved-bit behavior and silicon reset values remain unknown.
+         */
+        s->upper_control[(offset - S5L8702_SM1_UPPER_BASE) / 4] =
+            (uint32_t)value;
+        return;
+    }
+
     if (offset >= S5L8702_SM1_REG_BYTES) {
         return;
     }
 
     /*
-     * The engine is "powered" (clock will lock, run bit follows) once the
-     * firmware issues any of its bring-up writes -- deriving this from the
-     * guest's own first move keeps the model coherent instead of hard-wiring
-     * the bit on.
+     * Inherited approximation: selected writes set a synthetic powered flag.
+     * This is not a decoded power/clock state machine. In particular,
+     * 0x080a3010 also calls the +0x824 helper when +0x860 bit 2 is set.
      */
     switch (offset) {
-    case S5L8702_SM1_CODEC_EN:
-    case S5L8702_SM1_COMMIT:
+    case S5L8702_SM1_CONTROL_824:
+    case S5L8702_SM1_CONTROL_C48:
         s->powered = true;
         break;
     case S5L8702_SM1_RUN:
@@ -155,7 +177,18 @@ static void s5l8702_sm1_reset_enter(Object *obj, ResetType type)
     S5L8702SM1State *s = S5L8702_SM1(obj);
 
     memset(s->reg, 0, sizeof(s->reg));
+    /* Provisional reset contents, not established silicon defaults. */
+    memset(s->upper_control, 0, sizeof(s->upper_control));
     s->powered = false;
+}
+
+static int s5l8702_sm1_pre_load(void *opaque)
+{
+    S5L8702SM1State *s = opaque;
+
+    /* Version 1 had an all-zero upper window and serialized no controls. */
+    memset(s->upper_control, 0, sizeof(s->upper_control));
+    return 0;
 }
 
 static void s5l8702_sm1_init(Object *obj)
@@ -170,11 +203,14 @@ static void s5l8702_sm1_init(Object *obj)
 
 static const VMStateDescription vmstate_s5l8702_sm1 = {
     .name = TYPE_S5L8702_SM1,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .pre_load = s5l8702_sm1_pre_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32_ARRAY(reg, S5L8702SM1State, S5L8702_SM1_REG_WORDS),
         VMSTATE_BOOL(powered, S5L8702SM1State),
+        VMSTATE_UINT32_ARRAY_V(upper_control, S5L8702SM1State,
+                               S5L8702_SM1_UPPER_WORDS, 2),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -184,7 +220,7 @@ static void s5l8702_sm1_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
-    dc->desc = "S5L8702 SM1 audio clock/stream engine";
+    dc->desc = "S5L8702 SM1 engine (partial)";
     rc->phases.enter = s5l8702_sm1_reset_enter;
     dc->vmsd = &vmstate_s5l8702_sm1;
     dc->user_creatable = false;
