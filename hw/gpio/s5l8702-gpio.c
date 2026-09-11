@@ -253,6 +253,18 @@ static void s5l8702_gpio_set(void *opaque, int n, int level)
     qemu_set_irq(s->input_irq[n], !!level);
 }
 
+static void gpio_wheel_button(void *opaque, int n, int level)
+{
+    S5L8702GpioState *s = opaque;
+    uint8_t *button[] = {
+        &s->clickwheel_select_pressed, &s->clickwheel_play_pressed,
+        &s->clickwheel_prev_pressed, &s->clickwheel_menu_pressed,
+        &s->clickwheel_next_pressed,
+    };
+
+    *button[n] = !!level;
+}
+
 static void s5l8702_gpio_reset_enter(Object *obj, ResetType type)
 {
     S5L8702GpioState *s = S5L8702_GPIO(obj);
@@ -328,6 +340,7 @@ static void s5l8702_gpio_init(Object *obj)
                           TYPE_S5L8702_GPIO, S5L8702_GPIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     qdev_init_gpio_in(DEVICE(s), s5l8702_gpio_set, S5L8702_GPIO_PINS);
+    qdev_init_gpio_in_named(DEVICE(s), gpio_wheel_button, "wheel-button", 5);
     qdev_init_gpio_out(DEVICE(s), s->output, S5L8702_GPIO_PINS);
     qdev_init_gpio_out_named(DEVICE(s), s->input_irq, "input-irq",
                             S5L8702_GPIO_PINS);

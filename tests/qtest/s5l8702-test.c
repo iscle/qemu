@@ -1389,6 +1389,147 @@ static void test_wheel(void)
     qtest_quit(q);
 }
 
+static void wheel_key(QTestState *q, const char *key, bool down)
+{
+    qtest_qmp_assert_success(q,
+        "{'execute':'input-send-event', 'arguments': {'events': ["
+        "{'type':'key','data':{'down':%i,"
+        "'key':{'type':'qcode','data':%s}}}]}}", down, key);
+}
+
+static uint32_t wheel_query(QTestState *q)
+{
+    /* A restored report deadline can deliver an event before our query. */
+    for (unsigned i = 0; qtest_readl(q, WHEEL + 0x0c) & 1; i++) {
+        g_assert_cmpuint(i, <, 16);
+        g_assert_cmphex(qtest_readl(q, WHEEL + 0x18) & 0xff, ==, 0x1a);
+    }
+    qtest_writel(q, WHEEL + 0x1c, 0xc000011d);
+    qtest_writel(q, WHEEL + 4, 1);
+    return qtest_readl(q, WHEEL + 0x18);
+}
+
+static uint32_t wheel_gpio_clock(QTestState *q, bool high)
+{
+    for (unsigned retry = 0; retry < 8; retry++) {
+        uint32_t value = qtest_readl(q, 0x3cf001c4);
+
+        if (!!(value & (1u << 3)) == high) {
+            return value;
+        }
+    }
+    g_assert_not_reached();
+}
+
+static uint32_t wheel_gpio_query(QTestState *q)
+{
+    uint32_t command = 0xc000011d;
+    uint32_t reply = 0;
+
+    qtest_writel(q, 0x3cf001c0, 0x00010100); /* E2/E4 outputs, E3/E5 inputs. */
+    for (unsigned bit = 0; bit < 32; bit++) {
+        qtest_writel(q, 0x3cf001c4, ((command >> bit) & 1) << 4);
+        wheel_gpio_clock(q, true);
+        wheel_gpio_clock(q, false);
+    }
+    qtest_writel(q, 0x3cf001c4, 1u << 2);
+    for (unsigned bit = 0; bit < 32; bit++) {
+        wheel_gpio_clock(q, true);
+        reply |= ((wheel_gpio_clock(q, false) >> 5) & 1) << bit;
+    }
+    return reply;
+}
+
+static void test_wheel_buttons(void)
+{
+    QTestState *q = start();
+    static const char *keys[] = { "ret", "spc", "left", "esc", "right" };
+
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8000023a);
+    for (unsigned i = 0; i < G_N_ELEMENTS(keys); i++) {
+        uint32_t expected = 0x8000023a | (1u << (16 + i));
+
+        wheel_key(q, keys[i], true);
+        g_assert_cmphex(wheel_query(q), ==, expected);
+        g_assert_cmphex(wheel_gpio_query(q), ==, expected);
+        wheel_key(q, keys[i], false);
+        g_assert_cmphex(wheel_query(q), ==, 0x8000023a);
+        g_assert_cmphex(wheel_gpio_query(q), ==, 0x8000023a);
+    }
+    qtest_quit(q);
+}
+
+static void test_wheel_input_state(void)
+{
+    QTestState *q = start();
+    g_autofree char *saved = NULL;
+    g_autofree char *loaded = NULL;
+
+    wheel_key(q, "right", true);
+    wheel_key(q, "d", true);
+    saved = qtest_hmp(q, "savevm wheel-input");
+    g_assert_cmpstr(saved, ==, "");
+    wheel_key(q, "d", false);
+    g_assert_cmphex(wheel_query(q), ==, 0x8010023a);
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8010023a);
+
+    /* Repeated key-downs must not keep postponing the first event packet. */
+    qtest_clock_step(q, 20000000);
+    wheel_key(q, "right", true);
+    qtest_clock_step(q, 20000000);
+    g_assert_cmphex(qtest_readl(q, WHEEL + 0x18), ==, 0x8000021a);
+
+    /* Controller reset clears queued events but keeps a held button. */
+    qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+    g_assert_cmphex(wheel_query(q), ==, 0x8010023a);
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8010023a);
+    wheel_key(q, "right", false);
+    g_assert_cmphex(wheel_query(q), ==, 0x8000023a);
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8000023a);
+
+    loaded = qtest_hmp(q, "loadvm wheel-input");
+    g_assert_cmpstr(loaded, ==, "");
+    g_assert_cmphex(wheel_query(q), ==, 0x8010023a);
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8010023a);
+    wheel_key(q, "right", false);
+    g_assert_cmphex(wheel_query(q), ==, 0x8010023a); /* D is still held. */
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8010023a);
+    wheel_key(q, "d", false);
+    g_assert_cmphex(wheel_query(q), ==, 0x8000023a);
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8000023a);
+
+    /* Several physical buttons can remain down across a controller reset. */
+    wheel_key(q, "ret", true);
+    wheel_key(q, "spc", true);
+    wheel_key(q, "esc", true);
+    qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+    g_assert_cmphex(wheel_query(q), ==, 0x800b023a);
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x800b023a);
+    wheel_key(q, "ret", false);
+    wheel_key(q, "spc", false);
+    wheel_key(q, "esc", false);
+    g_assert_cmphex(wheel_query(q), ==, 0x8000023a);
+    g_assert_cmphex(wheel_gpio_query(q), ==, 0x8000023a);
+    qtest_quit(q);
+}
+
+static void test_wheel_touch_reset(void)
+{
+    QTestState *q = start();
+
+    wheel_key(q, "down", true);
+    wheel_key(q, "down", false);
+    qtest_clock_step(q, 40000000);
+    g_assert_cmphex(qtest_readl(q, WHEEL + 0x18), ==, 0xc000001a);
+    qtest_clock_step(q, 40000000);
+    g_assert_cmphex(qtest_readl(q, WHEEL + 0x18), ==, 0xc008001a);
+    qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+    qtest_writel(q, WHEEL + 0x1c, 0x8000063a);
+    qtest_writel(q, WHEEL + 4, 1);
+    g_assert_cmphex(qtest_readl(q, WHEEL + 0x18), ==, 0xc008063a);
+    qtest_quit(q);
+}
+
 static void test_dma_gpio(void)
 {
     QTestState *q = start();
@@ -3253,6 +3394,9 @@ int main(int argc, char **argv)
     qtest_add_func("/s5l8702/clocks", test_clocks);
     qtest_add_func("/s5l8702/clock-state", test_clock_state);
     qtest_add_func("/s5l8702/wheel", test_wheel);
+    qtest_add_func("/s5l8702/wheel-buttons", test_wheel_buttons);
+    qtest_add_func("/s5l8702/wheel-input-state", test_wheel_input_state);
+    qtest_add_func("/s5l8702/wheel-touch-reset", test_wheel_touch_reset);
     qtest_add_func("/s5l8702/dma-gpio", test_dma_gpio);
     qtest_add_func("/s5l8702/pl080-widths", test_pl080_widths);
     qtest_add_func("/s5l8702/pl080-lli", test_pl080_lli);

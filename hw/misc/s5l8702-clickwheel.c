@@ -30,6 +30,51 @@
 /* Report cadence is an emulation choice; the wire protocol carries state. */
 #define WHEEL_REPORT_NS (40 * SCALE_MS)
 
+static const struct {
+    QKeyCode key;
+    unsigned button;
+} wheel_keys[] = {
+    { Q_KEY_CODE_RET,   1 },
+    { Q_KEY_CODE_RIGHT, 2 },
+    { Q_KEY_CODE_D,     2 },
+    { Q_KEY_CODE_LEFT,  4 },
+    { Q_KEY_CODE_A,     4 },
+    { Q_KEY_CODE_SPC,   8 },
+    { Q_KEY_CODE_S,     8 },
+    { Q_KEY_CODE_ESC,  16 },
+    { Q_KEY_CODE_W,    16 },
+};
+
+static uint32_t wheel_buttons_from_keys(uint16_t keys)
+{
+    uint32_t buttons = 0;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(wheel_keys); i++) {
+        if (keys & (1u << i)) {
+            buttons |= wheel_keys[i].button;
+        }
+    }
+    return buttons;
+}
+
+static uint32_t wheel_query_buttons(S5L8702ClickwheelState *s)
+{
+    /* Query order: Select, Play, Prev, Menu, Next (retailOS 0x08362a9c). */
+    return (s->buttons & 1) | ((s->buttons & 2) << 3) |
+           (s->buttons & 4) | ((s->buttons & 8) >> 2) |
+           ((s->buttons & 16) >> 1);
+}
+
+static void wheel_update_buttons(S5L8702ClickwheelState *s)
+{
+    uint32_t buttons = wheel_query_buttons(s);
+
+    /* Share physical input state with the bootstrap GPIO protocol path. */
+    for (unsigned i = 0; i < S5L8702_WHEEL_BUTTON_COUNT; i++) {
+        qemu_set_irq(s->button[i], (buttons >> i) & 1);
+    }
+}
+
 static uint32_t wheel_pending(S5L8702ClickwheelState *s)
 {
     return s->pending | (s->count ? WHEEL_RX_READY : 0);
@@ -99,11 +144,7 @@ static void wheel_transfer(S5L8702ClickwheelState *s)
     }
     switch (cmd) {
     case WHEEL_BUTTONS:
-        /* 0x08362a9c: query packets order Select, Play, Prev, Menu, Next. */
-        wheel_push(s, WHEEL_BUTTONS |
-                   (((s->buttons & 1) | ((s->buttons & 2) << 3) |
-                     (s->buttons & 4) | ((s->buttons & 8) >> 2) |
-                     ((s->buttons & 16) >> 1)) << 16));
+        wheel_push(s, WHEEL_BUTTONS | (wheel_query_buttons(s) << 16));
         break;
     case WHEEL_POSITION:
         wheel_push(s, WHEEL_POSITION | (s->position << 16) |
@@ -200,28 +241,10 @@ static void wheel_input(DeviceState *dev, QemuConsole *src, InputEvent *evt)
     S5L8702ClickwheelState *s = S5L8702_CLICKWHEEL(dev);
     InputKeyEvent *key = evt->u.key.data;
     QKeyCode code = qemu_input_key_value_to_qcode(key->key);
-    uint32_t bit;
+    uint32_t buttons;
+    unsigned i;
 
     switch (code) {
-    case Q_KEY_CODE_RET:
-        bit = 1;
-        break;
-    case Q_KEY_CODE_RIGHT:
-    case Q_KEY_CODE_D:
-        bit = 2;
-        break;
-    case Q_KEY_CODE_LEFT:
-    case Q_KEY_CODE_A:
-        bit = 4;
-        break;
-    case Q_KEY_CODE_S:
-    case Q_KEY_CODE_SPC:
-        bit = 8;
-        break;
-    case Q_KEY_CODE_ESC:
-    case Q_KEY_CODE_W:
-        bit = 16;
-        break;
     case Q_KEY_CODE_UP:
     case Q_KEY_CODE_Q:
     case Q_KEY_CODE_DOWN:
@@ -236,13 +259,27 @@ static void wheel_input(DeviceState *dev, QemuConsole *src, InputEvent *evt)
         }
         return;
     default:
+        break;
+    }
+    for (i = 0; i < ARRAY_SIZE(wheel_keys); i++) {
+        if (wheel_keys[i].key == code) {
+            break;
+        }
+    }
+    if (i == ARRAY_SIZE(wheel_keys)) {
         return;
     }
     if (key->down) {
-        s->buttons |= bit;
+        s->keys |= 1u << i;
     } else {
-        s->buttons &= ~bit;
+        s->keys &= ~(1u << i);
     }
+    buttons = wheel_buttons_from_keys(s->keys);
+    if (buttons == s->buttons) {
+        return;
+    }
+    s->buttons = buttons;
+    wheel_update_buttons(s);
     s->reports = 10;
     wheel_schedule(s);
 }
@@ -267,16 +304,20 @@ static void wheel_reset_enter(Object *obj, ResetType type)
 
     timer_del(&s->timer);
     s->control = s->command = s->divider = s->mask = s->pending = s->tx = 0;
-    s->head = s->count = s->buttons = s->position = s->reports = 0;
-    s->steps = 0;
-    s->untouch_at = 0;
-    s->touched = false;
+    s->head = s->count = s->reports = 0;
+    /* Controller reset does not release physical keys or remove a finger. */
     memset(s->fifo, 0, sizeof(s->fifo));
 }
 
 static void wheel_reset_hold(Object *obj)
 {
-    wheel_update_irq(S5L8702_CLICKWHEEL(obj));
+    S5L8702ClickwheelState *s = S5L8702_CLICKWHEEL(obj);
+
+    wheel_update_irq(s);
+    wheel_update_buttons(s);
+    if (s->buttons || s->steps || s->touched) {
+        wheel_schedule(s);
+    }
 }
 
 static int wheel_post_load(void *opaque, int version_id)
@@ -284,16 +325,33 @@ static int wheel_post_load(void *opaque, int version_id)
     S5L8702ClickwheelState *s = opaque;
 
     if (s->head >= S5L8702_WHEEL_FIFO_SIZE ||
-        s->count > S5L8702_WHEEL_FIFO_SIZE || s->position >= 96) {
+        s->count > S5L8702_WHEEL_FIFO_SIZE || s->position >= 96 ||
+        (s->buttons & ~31u)) {
+        return -EINVAL;
+    }
+    if (version_id == 1) {
+        uint32_t buttons = s->buttons;
+
+        /* Old snapshots did not distinguish host aliases of a button. */
+        s->keys = 0;
+        for (unsigned i = 0; i < ARRAY_SIZE(wheel_keys); i++) {
+            if (buttons & wheel_keys[i].button) {
+                s->keys |= 1u << i;
+                buttons &= ~wheel_keys[i].button;
+            }
+        }
+    } else if ((s->keys >> ARRAY_SIZE(wheel_keys)) ||
+               wheel_buttons_from_keys(s->keys) != s->buttons) {
         return -EINVAL;
     }
     wheel_update_irq(s);
+    wheel_update_buttons(s);
     return 0;
 }
 
 static const VMStateDescription wheel_vmstate = {
     .name = TYPE_S5L8702_CLICKWHEEL,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = wheel_post_load,
     .fields = (VMStateField[]) {
@@ -314,6 +372,7 @@ static const VMStateDescription wheel_vmstate = {
         VMSTATE_BOOL(touched, S5L8702ClickwheelState),
         VMSTATE_INT64(untouch_at, S5L8702ClickwheelState),
         VMSTATE_TIMER(timer, S5L8702ClickwheelState),
+        VMSTATE_UINT16_V(keys, S5L8702ClickwheelState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -341,6 +400,8 @@ static void wheel_init(Object *obj)
                           TYPE_S5L8702_CLICKWHEEL, S5L8702_CLICKWHEEL_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(obj), s->button, "button-state",
+                            S5L8702_WHEEL_BUTTON_COUNT);
     timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, wheel_tick, s);
 }
 

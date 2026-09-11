@@ -326,6 +326,11 @@ static void s5l8702_realize(DeviceState *dev, Error **errp) {
         qdev_connect_gpio_out_named(DEVICE(&s->gpio), "input-irq", pin,
                                    qdev_get_gpio_in(DEVICE(&s->sysic), pin));
     }
+    /* The GPIO bootstrap path queries the same five physical wheel buttons. */
+    for (unsigned i = 0; i < S5L8702_WHEEL_BUTTON_COUNT; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->clickwheel), "button-state", i,
+            qdev_get_gpio_in_named(DEVICE(&s->gpio), "wheel-button", i));
+    }
     /* 0x083602c0 supplies GPIO 55 to the panel update callback registration. */
     qdev_connect_gpio_out_named(DEVICE(&s->lcd), "te", 0,
                                qdev_get_gpio_in(DEVICE(&s->gpio), 55));

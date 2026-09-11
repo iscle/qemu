@@ -1017,7 +1017,16 @@ RSTSR remains a register-file placeholder: reset causes and acknowledgement
 semantics have not been established in the checked original boot paths.
 
 The watchdog address range is an unimplemented device in the machine, despite
-the existence of a watchdog source filename. MIU remapping works, while
+the existence of an empty watchdog source file. Boot ROM
+``0x200000c0..0x200000c8`` writes ``0xa5`` to ``0x3c800000``.
+Original retailOS reset routine ``0x0835d028`` writes zero there, then
+writes the separate SWRCON reset command; updater routine ``0x08009aa8``
+uses the same sequence. These accesses agree with a watchdog-disable
+key and rearming before reset. They do not confirm the counter divider,
+prescaler, counter-clear key, interrupt routing, or oscillator-start behavior
+described for the older S5L8700. The S5L8702 watchdog still needs a model
+supported by further evidence; the older specification has not been used
+as a substitute for that confirmation. MIU remapping works, while
 DRAM timing, self-refresh, and most MIU registers are only readback.
 
 QEMU timers schedule device events in virtual time; their presence does
@@ -1128,8 +1137,38 @@ semantics are unverified. Non-output pins currently drive zero on the
 model's output connection; there is no resolved pin network. The retained
 boot-time wheel serial workaround advances on PDAT reads only when the
 four wheel pins have the expected GPIO modes. It affects only E3/E5 and
-preserves E6/E7 and output bits, but still has no physical serial timing
-or shared button state with the regular wheel device.
+preserves E6/E7 and output bits, but still has no physical serial timing.
+
+**Bootstrap button state now shares the normal input source.** The GPIO
+bootstrap path previously had five button fields that never received
+keyboard events. Its query replied with no buttons even while the regular
+wheel controller reported Select pressed. The wheel input device now
+distributes the five button levels to both protocol paths through named
+QEMU connections. These connections carry internal input state; a physical
+serial-bus model remains outstanding. Controller reset preserves held keys,
+touch position, and pending host rotation. Separately held keyboard aliases
+are tracked independently, and repeated key-downs do not postpone the first
+event packet indefinitely.
+
+Original EFI ``TouchWheel`` routine at module offset ``0x220`` transmits
+``0xc000011d`` through GPIO E2/E4 while polling E3/E5, then accepts reply
+``0x8000023a`` with button bits 16..20 in Select, Play, Previous, Menu,
+Next order. The instructions at ``0x294..0x398`` implement the exchange;
+``0x39e..0x3e6`` validates and decodes the reply. Those instructions match
+the executing boot code at ``0x0befe220`` in a fresh private VM.
+retailOS ``0x08362a9c`` decodes the same query-bit order through its regular
+controller driver ``0x08362a0c``. Unsolicited event packets use a different
+button order, which remains handled separately.
+
+A regression reproduces the former missing Select bit, then checks every
+button's press and release through both interfaces. Additional tests cover
+simultaneous buttons, reset with held buttons/touch, independent aliases,
+repeated key-downs and snapshot restoration. In the running original boot
+driver, resetting with Select held produces raw reply ``0x8001023a`` and
+decoded result ``0x01`` at ``0x0befe426``. No guest instruction or register
+result was overridden. The new snapshot version records host aliases;
+older snapshots retain only button state, so their original alias choice
+cannot be recovered. Cross-version migration remains unverified.
 
 The regular wheel has a bounded FIFO and working keyboard events, but
 packet cadence, queue depth, rotation steps, and touch/release timing are
@@ -1497,7 +1536,7 @@ Local audit evidence and next steps
 
 The audit VM used the normal launcher with ``-snapshot`` so game attempts
 and navigation did not write back to the restored disk/NOR. Ghidra was run
-one process at a time. Peripheral builds use ``ninja -j2``; all seventy-three
+one process at a time. Peripheral builds use ``ninja -j2``; all seventy-six
 current qtests pass.
 
 The paths below identify local investigation artifacts in the surrounding
@@ -1534,6 +1573,16 @@ records all seventy-three passing tests after the fix. ``fixed-main.png``
 shows a fresh boot of the original-input disk to the normal UI;
 ``original-input.txt`` records the unchanged firmware hash and damaged
 library marker. These tests used ``-snapshot`` and a silent audio backend.
+
+Wheel input evidence is in ``ipod-work/wheel-input/``: ``before.log``
+reproduces the missing bootstrap button; ``retail-original.c`` and
+``efi-thumb.c`` contain the decompiled routines, with original Thumb
+instructions in ``efi-touchwheel.asm``. ``bootstrap-gdb.log``
+and ``bootstrap-dram.bin`` locate the matching EFI instructions in the live
+boot. ``held-bootstrap.log`` records the original driver's decoded Select
+result across reset. ``full-qtest.log`` records all seventy-six passing
+tests. Watchdog access evidence is in ``ipod-work/watchdog/``; this
+investigation has not replaced the unimplemented watchdog.
 
 Game/SHA evidence includes ``ipod-work/game-digest-reconstruction.log``,
 ``game-verifier-after-sha.log``, ``sha-dma-driver.c``,
