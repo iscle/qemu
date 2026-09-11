@@ -133,8 +133,10 @@ static void test_uart_registers(void)
         for (unsigned i = 0; i < 3; i++) {
             qtest_writel(q, base + 0x20, 'a' + i);
         }
+        qtest_clock_step(q, 600000);
         g_assert_false(qtest_get_irq(q, 0));
         qtest_writel(q, base + 0x20, 'd');
+        qtest_clock_step(q, 200000);
         g_assert_cmphex(qtest_readl(q, VIC0 + 8), ==, 1U << (24 + port));
         g_assert_true(qtest_get_irq(q, 0));
         g_assert_cmphex(qtest_readl(q, base + 0x10) & 0x178, ==, 0x30);
@@ -157,11 +159,14 @@ static void test_uart_fifo(void)
 
     qtest_irq_intercept_in(q, "/machine/soc/cpu");
     qtest_writel(q, VIC0 + 0x10, 1U << 24);
+    qtest_writel(q, UART0, 3); /* 8N1, 160 us/frame at the reset 12 MHz PCLK. */
+    qtest_writel(q, UART0 + 0x28, 11);
     qtest_writel(q, UART0 + 8, 0x37); /* 16-byte RX trigger, reset both. */
     qtest_writel(q, UART0 + 4, 0x25); /* Interrupts masked. */
     for (unsigned i = 0; i < 16; i++) {
         qtest_writel(q, UART0 + 0x20, 0x40 + i);
     }
+    qtest_clock_step(q, 2560000);
     /* Original diagnostic decodes low four bits plus bit 8 as 16 bytes. */
     g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x100);
     g_assert_false(qtest_get_irq(q, 0));
@@ -169,6 +174,7 @@ static void test_uart_fifo(void)
     g_assert_true(qtest_get_irq(q, 0));
     /* Overrun must preserve unread data. */
     qtest_writel(q, UART0 + 0x20, 0xff);
+    qtest_clock_step(q, 160000);
     g_assert_cmphex(qtest_readl(q, UART0 + 0x14), ==, 1);
     g_assert_cmphex(qtest_readl(q, UART0 + 0x14), ==, 0);
     qtest_writel(q, UART0 + 0x10, 0x178);
@@ -181,6 +187,7 @@ static void test_uart_fifo(void)
     qtest_writel(q, UART0 + 8, 6);
     qtest_writel(q, UART0 + 0x20, 'x');
     qtest_writel(q, UART0 + 0x20, 'y');
+    qtest_clock_step(q, 320000);
     g_assert_cmphex(qtest_readl(q, UART0 + 0x14), ==, 1);
     g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'x');
     qtest_quit(q);
@@ -192,6 +199,8 @@ static void test_uart_gate_state(void)
     g_autofree char *result = NULL;
     uint32_t gates = qtest_readl(q, CLK + 0x4c);
 
+    qtest_writel(q, UART0, 3); /* 8N1, 160 us/frame at the reset 12 MHz PCLK. */
+    qtest_writel(q, UART0 + 0x28, 11);
     qtest_writel(q, UART0 + 8, 7);
     qtest_writel(q, UART0 + 4, 0x1025);
     qtest_writel(q, CLK + 0x4c, gates | 0x200);
@@ -212,13 +221,9 @@ static void test_uart_gate_state(void)
     g_assert_cmpstr(result, ==, "");
     g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
     qtest_writel(q, CLK + 0x4c, gates);
-    /* A BH drains the provisional backend-driven TX when its gate opens. */
-    for (unsigned i = 0; i < 100; i++) {
-        if (qtest_readl(q, UART0 + 0x18) == 0x100) {
-            break;
-        }
-        qtest_clock_step(q, 1);
-    }
+    /* Opening the gate resumes serialization; it does not deliver instantly. */
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0xf0);
+    qtest_clock_step(q, 2560000);
     g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x100);
     for (unsigned i = 0; i < 16; i++) {
         g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 0x60 + i);
@@ -237,11 +242,14 @@ static void test_uart_backend(void)
                                     "-serial chardev:uart-log");
     QDict *response;
 
+    qtest_writel(q, UART0, 3); /* 8N1, 160 us/frame at the reset 12 MHz PCLK. */
+    qtest_writel(q, UART0 + 0x28, 11);
     qtest_writel(q, UART0 + 8, 7);
     qtest_writel(q, UART0 + 4, 5);
     for (unsigned i = 0; i < 4; i++) {
         qtest_writel(q, UART0 + 0x20, 'a' + i);
     }
+    qtest_clock_step(q, 640000);
     response = qtest_qmp(q, "{'execute':'ringbuf-read','arguments':"
                            "{'device':'uart-log','size':64}}");
     g_assert_cmpstr(qdict_get_str(response, "return"), ==, "abcd");
@@ -255,6 +263,7 @@ static void test_uart_backpressure(void)
     int pair[2], sent, total = 0, capacity = 4096;
     uint8_t buffer[256] = { 0 };
     QTestState *q;
+    QDict *response;
     g_autofree char *args = NULL;
 
     g_assert_cmpint(qemu_socketpair(AF_UNIX, SOCK_STREAM, 0, pair), ==, 0);
@@ -275,15 +284,18 @@ static void test_uart_backpressure(void)
                            "-serial chardev:uart-stall", pair[1]);
     q = start_with_args(args);
     close(pair[1]);
+    qtest_writel(q, UART0, 3); /* 8N1, 160 us/frame at the reset 12 MHz PCLK. */
+    qtest_writel(q, UART0 + 0x28, 11);
     qtest_writel(q, UART0 + 8, 7);
     qtest_writel(q, UART0 + 4, 5);
-    for (unsigned i = 0; i < 17; i++) {
+    for (unsigned i = 0; i < 18; i++) {
         qtest_writel(q, UART0 + 0x20, 'a' + i);
     }
-    /* The monitor remains responsive and the guest queue stops at 16. */
+    /* One byte is shifting, with 16 waiting in the FIFO. */
     g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
-    qtest_clock_step(q, 1000000000);
-    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x200);
+    qtest_clock_step(q, 2720000); /* All 17 frames complete despite the host. */
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 6, ==, 6);
     while (total) {
         int got = recv(pair[0], buffer, MIN(total, sizeof(buffer)), 0);
 
@@ -293,7 +305,7 @@ static void test_uart_backpressure(void)
         }
         total -= got;
     }
-    for (unsigned i = 0; i < 16; i++) {
+    for (unsigned i = 0; i < 17; i++) {
         int got = -1;
 
         for (unsigned retry = 0; retry < 100; retry++) {
@@ -324,7 +336,203 @@ static void test_uart_backpressure(void)
     for (unsigned i = 0; i < 4; i++) {
         g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'w' + i);
     }
+    /* Exhaust the separate host buffer without stopping hardware time. */
+    for (unsigned i = 0; i < 4300; i++) {
+        qtest_writel(q, UART0 + 0x20, 0x55);
+        qtest_clock_step(q, 160000);
+    }
+    response = qtest_qmp(q, "{'execute':'qom-get','arguments':"
+                           "{'path':'/machine/soc/uart[0]',"
+                           "'property':'dropped-output'}}");
+    g_assert_cmpuint(qdict_get_int(response, "return"), >, 0);
+    qobject_unref(response);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 6, ==, 6);
     close(pair[0]);
+    qtest_quit(q);
+}
+
+static void uart_timing_setup(QTestState *q, uint32_t control)
+{
+    qtest_writel(q, UART0, 3);
+    qtest_writel(q, UART0 + 0x28, 11);
+    qtest_writel(q, UART0 + 8, 7);
+    qtest_writel(q, UART0 + 4, control);
+}
+
+static void test_uart_timing(void)
+{
+    QTestState *q = start();
+
+    uart_timing_setup(q, 0x25);
+    qtest_writel(q, UART0 + 0x20, 0xa5);
+    qtest_writel(q, UART0 + 0x20, 0x5a);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x10);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 0);
+    qtest_clock_step(q, 159999);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0x10);
+    qtest_clock_step(q, 1);
+    /* FIFO empty is distinct from the second character still shifting. */
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 3);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 0xa5);
+    qtest_clock_step(q, 159999);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 2);
+    qtest_clock_step(q, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 0x5a);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 6);
+
+    /* A divisor update applies to the next frame, preserving the active one. */
+    qtest_writel(q, UART0 + 0x20, 'A');
+    qtest_clock_step(q, 80000);
+    qtest_writel(q, UART0 + 0x28, 23);
+    qtest_writel(q, UART0 + 0x20, 'B');
+    qtest_clock_step(q, 79999);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18) & 0xf, ==, 0);
+    qtest_clock_step(q, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'A');
+    qtest_clock_step(q, 319999);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 2);
+    qtest_clock_step(q, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'B');
+
+    /* FIFO reset preserves the active shifter, while disabling TX aborts it. */
+    qtest_writel(q, UART0 + 0x28, 11);
+    qtest_writel(q, UART0 + 0x20, 'C');
+    qtest_writel(q, UART0 + 0x20, 'D');
+    qtest_clock_step(q, 80000);
+    qtest_writel(q, UART0 + 8, 5);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 2);
+    qtest_clock_step(q, 80000);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'C');
+    qtest_writel(q, UART0 + 0x20, 'E');
+    qtest_clock_step(q, 80000);
+    qtest_writel(q, UART0 + 4, 0x21);
+    qtest_clock_step(q, 320000);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 6);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x18), ==, 0);
+    qtest_quit(q);
+}
+
+static void test_uart_clock_state(void)
+{
+    QTestState *q = start();
+    g_autofree char *result = NULL;
+    uint32_t gates = qtest_readl(q, CLK + 0x4c);
+
+    uart_timing_setup(q, 0x425); /* External 12 MHz input. */
+    qtest_writel(q, UART0 + 0x20, 'K');
+    qtest_clock_step(q, 40000);
+    qtest_writel(q, CLK + 4, 0x4000); /* Halve PCLK, leaving UCLK alone. */
+    qtest_clock_step(q, 119999);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 1, ==, 0);
+    qtest_clock_step(q, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'K');
+    qtest_writel(q, UART0 + 4, 0x25); /* Now select the 6 MHz PCLK. */
+    qtest_writel(q, UART0 + 0x20, 'M');
+    qtest_clock_step(q, 80000); /* One quarter of a frame. */
+    qtest_writel(q, CLK + 4, 0); /* Remaining 3/4 at 12 MHz: 120 us. */
+    qtest_clock_step(q, 119999);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 1, ==, 0);
+    qtest_clock_step(q, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'M');
+
+    /* Preserve less than one source clock through a gate and snapshot. */
+    qtest_writel(q, UART0 + 0x20, 'N');
+    qtest_clock_step(q, 1);
+    qtest_writel(q, CLK + 0x4c, gates | 0x200);
+    result = qtest_hmp(q, "savevm uart-shift");
+    g_assert_cmpstr(result, ==, "");
+    g_clear_pointer(&result, g_free);
+    qtest_writel(q, UART0 + 4, 0);
+    result = qtest_hmp(q, "loadvm uart-shift");
+    g_assert_cmpstr(result, ==, "");
+    qtest_clock_step(q, 1000000000);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 2);
+    qtest_writel(q, CLK + 0x4c, gates);
+    qtest_clock_step(q, 159998);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 1, ==, 0);
+    qtest_clock_step(q, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'N');
+    qtest_quit(q);
+}
+
+static void test_uart_receive_timeout(void)
+{
+    QTestState *q = start();
+    g_autofree char *result = NULL;
+
+    qtest_irq_intercept_in(q, "/machine/soc/cpu");
+    qtest_writel(q, VIC0 + 0x10, 1U << 24);
+    uart_timing_setup(q, 0x8a5); /* Timeout enabled, with its IRQ unmasked. */
+    qtest_writel(q, UART0 + 0x20, 'X');
+    qtest_clock_step(q, 160000);
+    qtest_writel(q, UART0 + 0x10, 0x178);
+    qtest_clock_step(q, 240000); /* Half of the modeled three-frame timeout. */
+    /* Masking must not restart the counter. */
+    qtest_writel(q, UART0 + 4, 0xa5);
+    result = qtest_hmp(q, "savevm uart-timeout");
+    g_assert_cmpstr(result, ==, "");
+    g_clear_pointer(&result, g_free);
+    qtest_writel(q, UART0 + 4, 0);
+    result = qtest_hmp(q, "loadvm uart-timeout");
+    g_assert_cmpstr(result, ==, "");
+    qtest_clock_step(q, 239999);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 8, ==, 0);
+    qtest_clock_step(q, 1);
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 8, ==, 8);
+    g_assert_false(qtest_get_irq(q, 0));
+    qtest_writel(q, UART0 + 4, 0x8a5);
+    g_assert_true(qtest_get_irq(q, 0));
+    qtest_writel(q, UART0 + 0x10, 8);
+    g_assert_false(qtest_get_irq(q, 0));
+    qtest_clock_step(q, 1000000);
+    g_assert_false(qtest_get_irq(q, 0));
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'X');
+
+    qtest_writel(q, UART0 + 0x20, 'Y');
+    qtest_clock_step(q, 240000); /* One frame, then 80 us of idle RX. */
+    /* TX FIFO reset must not delay RX timeout. */
+    qtest_writel(q, UART0 + 8, 5);
+    qtest_clock_step(q, 399999);
+    g_assert_false(qtest_get_irq(q, 0));
+    qtest_clock_step(q, 1);
+    g_assert_true(qtest_get_irq(q, 0));
+    g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, 'Y');
+    qtest_writel(q, UART0 + 0x10, 0x178);
+    qtest_clock_step(q, 1000000);
+    g_assert_false(qtest_get_irq(q, 0));
+    qtest_quit(q);
+}
+
+static void test_uart_formats(void)
+{
+    static const struct {
+        uint32_t line, divisor, tuning;
+        int64_t ns;
+        uint8_t data;
+    } cases[] = {
+        { 0,    11,      0,          112000,     0x1f }, /* 5N1 */
+        { 0x24, 11,      0,          144000,     0x1f }, /* 5O2 */
+        { 3,    11,      0xffffff,   150000,     0xff }, /* Shorter bits */
+        { 3,    11,      0x555555,   170000,     0xff }, /* Longer bits */
+        { 3,    0x8000b, 0,           80000,     0xff }, /* Eight samples */
+        { 0x2f, 0xffff,  0x555555, 1114112000,    0xff }, /* Maximum frame */
+    };
+    QTestState *q = start();
+
+    for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+        qtest_writel(q, UART0 + 4, 0);
+        qtest_writel(q, UART0, cases[i].line);
+        qtest_writel(q, UART0 + 0x28, cases[i].divisor);
+        qtest_writel(q, UART0 + 0x34, cases[i].tuning);
+        qtest_writel(q, UART0 + 8, 7);
+        qtest_writel(q, UART0 + 4, 0x25);
+        qtest_writel(q, UART0 + 0x20, 0xff);
+        qtest_clock_step(q, cases[i].ns - 1);
+        g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 1, ==, 0);
+        qtest_clock_step(q, 1);
+        g_assert_cmphex(qtest_readl(q, UART0 + 0x24), ==, cases[i].data);
+        g_assert_cmphex(qtest_readl(q, UART0 + 0x10) & 7, ==, 6);
+    }
     qtest_quit(q);
 }
 
@@ -2933,6 +3141,10 @@ int main(int argc, char **argv)
     qtest_add_func("/s5l8702/uart/gate-state", test_uart_gate_state);
     qtest_add_func("/s5l8702/uart/backend", test_uart_backend);
     qtest_add_func("/s5l8702/uart/backpressure", test_uart_backpressure);
+    qtest_add_func("/s5l8702/uart/timing", test_uart_timing);
+    qtest_add_func("/s5l8702/uart/clock-state", test_uart_clock_state);
+    qtest_add_func("/s5l8702/uart/receive-timeout", test_uart_receive_timeout);
+    qtest_add_func("/s5l8702/uart/formats", test_uart_formats);
     qtest_add_func("/s5l8702/i2s-stop", test_i2s_stop);
     qtest_add_func("/s5l8702/i2c", test_i2c);
     qtest_add_func("/s5l8702/i2c-stop", test_i2c_stop);

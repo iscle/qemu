@@ -1251,41 +1251,77 @@ decompilation and disassembly:
   ``0x080164f4``, clearing PWRCON1 bit 9. The modeled gate now stops byte
   delivery and resumes queued TX data when opened.
 
-**UART timing and accessory support are still incomplete.** There is no
-baud-clock serializer, separate TX shift register, RX timeout event,
-autobaud edge detector, modem-pin model, DMA request interface or infrared
-mode. UBRDIV and the fine-tuning registers are storage only. This replacement
-removes the Exynos timeout calculation that incorrectly interpreted UCON's
-interrupt enables as a timeout length and used an unrelated fixed 24 MHz
-clock; it does not claim that receive timeouts have been implemented.
-TX drains when the character backend accepts bytes. A nonblocking write and
-writable watch replace ``qemu_chr_fe_write_all``, so a stalled backend cannot
-block QEMU's main loop, but host backpressure still changes guest-visible
-TX occupancy. This is a remaining timing workaround. Without a connected
-backend, TX data is discarded. RX bytes arrive at backend speed; the model
-uses backend backpressure rather than physical wire overruns.
+**UART TX serialization and receive timeout are now clocked.** The original
+updater ``0x0801b8fc`` computes a divisor from clock rate, requested baud and
+sample count, and stores ``16 - sample count`` above UBRDIV's low 16 bits.
+``0x0801b6c4`` selects the source with UCON bit 10. The model now has PCLK
+and UCLK inputs and a separate TX shift register. retailOS ``0x080d00c4``
+waits for UTRSTAT bit 2 independently of its FIFO-empty polling. UTRSTAT
+bits 1/2 now distinguish an empty TX queue from a completely idle
+transmitter. A frame consumes source-clock cycles derived from its divisor,
+data bits, parity and stop bits. The virtual timer schedules the next frame
+completion or receive-idle deadline; it does not periodically inject IRQs.
+Clock gating pauses the remaining cycles, including partial cycles, and a
+frequency change resumes them at the new rate. Format/divisor values are
+latched when a frame enters the shift register.
 
-The one-byte non-FIFO mode, loopback, reset defaults/self-clearing bits,
-exact trigger levels
-(RX 4/8/12/16 and TX 0/4/8/12), and interrupt generation at a FIFO threshold
-remain inferred from the related S5L8700 UART and corroborating Rockbox
+Completed TX bytes enter a separate, bounded 4096-byte host output queue.
+Nonblocking backend writes and writable watches drain that queue without
+changing the hardware FIFO or shift-register state. A stalled backend no
+longer changes guest-visible TX timing. Once the host queue fills, further
+completed bytes are discarded and counted in the read-only
+``dropped-output`` QOM property. An absent/disconnected backend discards
+output. These are explicit transport limitations, not hardware FIFO
+capacities or UART error flags. RX remains a completed-byte backend
+abstraction: bytes arrive at host speed, and backend backpressure substitutes
+for physical wire overruns. The host serial port's framing/baud parameters
+are not configured by this model.
+
+**Several timing details remain hypotheses.** retailOS initializes
+UCON=``0x405``/UBRDIV=12 and later uses automatic baud counts from 185 to
+1375, with divisor/fine-tuning choices compatible with conventional rates
+from a 12 MHz input. This does not prove the oscillator wiring. UCLK is
+connected to the board's 12 MHz OSC0 as a provisional connection, also
+identified as uncertain in Rockbox's
+`serial-6g.c
+<https://github.com/Rockbox/rockbox/blob/master/firmware/target/arm/s5l8702/ipod6g/serial-6g.c>`_.
+The original updater directly confirms the PCLK rate parameter, sample-count
+formula and clock-select bit, but its alternate-clock rate global has no
+identified initialization. The UART now consumes clock inputs rather than
+using the Exynos model's unrelated fixed 24 MHz rate.
+
+The fine-tuning pattern applies a one-sample stretch/shortening to individual
+bits according to the related
 `UC87xx driver
-<https://github.com/Rockbox/rockbox/blob/master/firmware/export/uc87xx.h>`_,
-rather than measurements of this S5L8702. Firmware confirms
-the register fields above, but does not prove every behavior on arbitrary
-access sequences. Per-byte error FIFOs, parity/framing errors, FIFO mode
-changes with queued data, reserved-bit masks and narrower MMIO accesses
-need further investigation. Overrun/break status is currently a single
-read-to-clear latch. GPIO pin multiplexing is not connected to this UART.
+<https://github.com/Rockbox/rockbox/blob/master/firmware/export/uc87xx.h>`_.
+A nonempty RX FIFO below its trigger produces a receive-timeout event after
+three frame times, following the S5L8700 description. UCON bit 7 enables
+timing and bit 11 masks the IRQ; UTRSTAT bit 3 is write-one-to-clear. Mask
+changes do not restart the counter. New RX activity or a read with data
+remaining restarts it; acknowledgement alone does not repeat the timeout.
+Firmware confirms these register fields and uses the event, but the exact
+idle period, restart behavior and fine-tuning waveforms have not been
+established on an S5L8702. Likewise, arbitrary mid-frame programming,
+FIFO-reset preservation of the shifter, disabling TX mid-frame, the
+one-byte non-FIFO holding register, loopback, reset defaults, exact trigger
+levels and non-8N1 formats remain related-hardware inferences. Tests of
+these behaviors establish model consistency, not physical measurements.
 
-Five qtests cover all four port IRQ routes, masked events, the original
-ISR's acknowledge-before-drain order, FIFO capacity and retained data on
-loopback overrun, the clock gate, snapshot/reset state, ring-buffer backend
-output, and a prefilled socket backend. The socket case verifies main-loop
-responsiveness under backpressure, bounded TX storage, subsequent ordered
-delivery and real backend RX. These are model regressions, not physical
-UART timing or dock protocol validation. Device state uses Resettable and VMState with
-bounded migration indices; whole-machine migration remains unverified.
+Autobaud edge detection, modem signals, GPIO multiplexing, per-byte error
+FIFOs, parity/framing errors, DMA and infrared remain absent. FIFO mode
+changes with queued data, reserved-bit masks and narrower MMIO accesses need
+further investigation. Overrun/break status is a single read-to-clear latch.
+
+Nine qtests cover the four IRQ routes, masking/acknowledgement, FIFO bounds,
+real backend RX, exact frame deadlines, clock selection and changes,
+fractional-cycle gate/snapshot restoration, idle timeout and its snapshot,
+format/divisor changes and host-backpressure isolation. The deliberately
+full socket test exhausts the bounded output queue while the transmitter
+continues completing frames. Resettable and VMState version 2 retain the
+active frame, remaining cycles, input clocks, queues and error/IRQ state;
+post-load validates bounds and reconstructs the deadline. Version 1 states
+start their previously untimed queued TX at the restored virtual time;
+whole-machine migration and cross-version migration remain unverified.
 Snapshots containing the former Exynos UART instances are incompatible
 with this replacement.
 Dock/accessory protocols, headphone insertion events, remote controls and
@@ -1436,7 +1472,7 @@ Local audit evidence and next steps
 
 The audit VM used the normal launcher with ``-snapshot`` so game attempts
 and navigation did not write back to the restored disk/NOR. Ghidra was run
-one process at a time. Peripheral builds use ``ninja -j2``; all sixty-eight
+one process at a time. Peripheral builds use ``ninja -j2``; all seventy-two
 current qtests pass.
 
 The paths below identify local investigation artifacts in the surrounding

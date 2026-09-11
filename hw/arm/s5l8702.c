@@ -283,6 +283,8 @@ static void s5l8702_realize(DeviceState *dev, Error **errp) {
 
         qdev_prop_set_chr(uart, "chardev", serial_hd(i));
         qdev_connect_clock_in(uart, "pclk", s->clk.uart_pclk);
+        /* The external UART source is modeled as OSC0; routing is unproven. */
+        qdev_connect_clock_in(uart, "uclk", &s->osc0);
         sysbus_realize(SYS_BUS_DEVICE(uart), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0,
                         S5L8702_UART0_MEM_BASE + i * 0x4000);
